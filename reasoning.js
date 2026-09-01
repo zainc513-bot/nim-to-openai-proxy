@@ -4,30 +4,8 @@
 // on/off, and how to pull reasoning text back out of responses that embed
 // it inline in content vs. as a structured field.
 
-// ─── Reasoning subsystem ────────────────────────────────────────────────────
-// Owns: which chat_template_kwargs/top-level fields each backend model needs
-// to control thinking, and how to pull reasoning text back out of responses
-// that embed it inline vs. as a structured field.
-
 const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
 if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
-
-// Reasoning/thinking parameters vary by backend model and aren't part of the
-// OpenAI schema, so they can't just be forwarded as-is — getReasoningPayload()
-// below maps each backend model to its own request shape (see the comments
-// on each case for that model's specific quirks).
-//
-// IMPORTANT: everything getReasoningPayload() returns is spread directly into
-// the top-level JSON body sent to NIM via axios. Do NOT wrap it in an
-// `extra_body` key — that's an openai-SDK-only convention that the official
-// SDKs unwrap client-side into top-level fields before sending. This proxy
-// posts to NIM's REST endpoint directly via axios, so a literal "extra_body"
-// key in the body is just silently ignored by the backend.
-//
-// Reasoning output format: by default, reasoning is kept out of `content`
-// and returned in a structured `reasoning`/`reasoning_content` field.
-// Clients that expect legacy inline <thinking> tags baked into content can
-// opt in by sending an `x-reasoning-format: inline` header.
 
 // Backend models that embed reasoning inline in `content` via delimiter tags,
 // rather than returning it as a separate structured field. Mapped to their
@@ -67,7 +45,6 @@ class DelimiterParser {
         this.inThinking = !this.inThinking;
         this.buffer = this.buffer.substring(tagIndex + targetTag.length);
       } else {
-        // Check for partial tag at the end
         let partialLen = 0;
         const maxLen = Math.min(this.buffer.length, targetTag.length - 1);
         for (let i = maxLen; i > 0; i--) {
@@ -110,12 +87,10 @@ class StreamNormalizer {
   constructor(model) {
     this.model = model;
     this.parser = null;
-    // ONLY use content delimiters for models that embed reasoning in content
     const tags = CONTENT_DELIMITER_TAGS[model];
     if (tags) {
       this.parser = new DelimiterParser(tags[0], tags[1]);
     }
-    // Models like Gemma 4, DeepSeek, GPT-OSS use structured fields and are NOT parsed here.
   }
 
   processDelta(delta) {
@@ -123,7 +98,6 @@ class StreamNormalizer {
     let reasoning = normalizedDelta.reasoning || normalizedDelta.reasoning_content || '';
     let content = normalizedDelta.content || '';
 
-    // Priority: Structured reasoning > Content delimiters
     if (!reasoning && content && this.parser) {
       const parsed = this.parser.processChunk(content);
       reasoning = parsed.reasoning;
@@ -197,8 +171,12 @@ const REASONING_EFFORT_ENUMS = {
 
   // K3 can never fully disable reasoning (see the kimi-k3 case in
   // getReasoningPayload below) — this enum only governs how hard it thinks,
-  // never whether it thinks at all.
-  'moonshotai/kimi-k3': ['low', 'high', 'max']
+  // never whether it thinks at all. NOTE: Moonshot's docs list 'high' as a
+  // supported tier long-term, but it is NOT yet implemented on this NIM
+  // deployment and returns a hard 400 — confirmed by requests succeeding
+  // with 'low' and failing with 'high' under otherwise identical
+  // conditions. Only 'low' and 'max' are actually live right now.
+  'moonshotai/kimi-k3': ['low', 'max']
 };
 
 function validReasoningEffort(model, effort) {
@@ -312,13 +290,12 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       // chat_template_kwargs.thinking:false (or equivalent) to send. The
       // only lever is how much it thinks, via a top-level reasoning_effort.
       //
-      // When thinking is "off" for this request, ask for the lowest tier
-      // instead of returning {} — omitting the field lets it fall through
-      // to Kimi's own default of 'max', the slowest and most expensive
-      // setting, which would silently ignore the caller's intent to keep
-      // this request cheap.
+      // IMPORTANT: use 'max' here, not 'high'. Moonshot's docs list 'high'
+      // as a supported tier, but it is not live yet on this NIM deployment
+      // and returns a 400 — 'low' and 'max' are the only values currently
+      // accepted. See the REASONING_EFFORT_ENUMS entry above.
       if (effort) return { reasoning_effort: effort };
-      return { reasoning_effort: enableThinking ? 'high' : 'low' };
+      return { reasoning_effort: enableThinking ? 'max' : 'low' };
     }
 
     default:

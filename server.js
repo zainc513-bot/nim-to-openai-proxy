@@ -129,10 +129,10 @@ const DEFAULT_MODEL = 'google/gemma-4-31b-it';
 // limited, timing out, etc.) delays every fallback behind it, so the
 // fastest/most-reliable known-good model should go first.
 const FALLBACK_MODELS = [
-  'openai/gpt-oss-20b',
-  'google/gemma-4-31b-it',
-  'mistralai/mistral-nemotron',
-  'nvidia/nemotron-3-super-120b-a12b'
+  'moonshotai/kimi-k3',
+  'deepseek-ai/deepseek-v4-pro-0813',
+  'deepseek-ai/deepseek-v4-flash-0731',
+  'minimaxai/minimax-m3'
 ];
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
@@ -326,6 +326,19 @@ function setCooldown(model, ms) {
   modelCooldowns.set(model, Date.now() + ms);
 }
 
+// Some backend models enforce fixed sampling parameters and reject requests
+// carrying different values with a hard 400 — not a soft ignore. Per
+// NVIDIA/Moonshot's own docs, Kimi-K3 requires temperature=1.0, top_p=0.95,
+// n=1, presence_penalty=0, frequency_penalty=0, and states these should be
+// omitted from requests entirely rather than sent as different values.
+// baseRequest always carries temperature (defaulted to 0.7 below in the
+// route handler) for every model, which is exactly what was triggering the
+// instant 400s on Kimi. Keyed by backend model ID; only forces the params a
+// given model is documented to require, model.
+const FIXED_SAMPLING_PARAMS = {
+  'moonshotai/kimi-k3': { temperature: 1.0, top_p: 0.95, n: 1, presence_penalty: 0, frequency_penalty: 0 }
+};
+
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
   const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
@@ -341,7 +354,8 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
   for (const model of attemptOrder) {
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
-    const fullRequest = { ...baseRequest, model, ...reasoningPayload };
+    const fixedParams = FIXED_SAMPLING_PARAMS[model] || {};
+    const fullRequest = { ...baseRequest, model, ...reasoningPayload, ...fixedParams };
 
     if (DEBUG_MODE) {
       console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
