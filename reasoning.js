@@ -161,7 +161,9 @@ const REASONING_EFFORT_ENUMS = {
   'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
-  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
+  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max'],
+  // Per NVIDIA's own GLM-5.3 model card: defaults to 'max' if omitted.
+  'z-ai/glm-5.3': ['low', 'high', 'max']
 };
 
 function validReasoningEffort(model, effort) {
@@ -265,8 +267,33 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
 
     case 'moonshotai/kimi-k3': {
       // No off-switch — omitting the field falls back to Kimi's own 'max'.
+      // Deliberately NOT tied to the global enableThinking toggle: 'max' is
+      // slow enough to exceed the platform's own gateway timeout (504,
+      // confirmed in production). Defaults to 'low' regardless of the
+      // global setting; only escalates on an explicit per-request override.
       if (effort) return { reasoning_effort: effort };
-      return { reasoning_effort: enableThinking ? 'high' : 'low' };
+      return { reasoning_effort: 'low' };
+    }
+
+    case 'z-ai/glm-5.3': {
+      // No off-switch, same as Kimi-K3 above — Z.ai's own docs and
+      // independent hands-on testing confirm sending
+      // thinking:{type:'disabled'} still returns 200 but reasoning
+      // continues regardless. reasoning_effort is the only real lever, and
+      // it silently defaults to 'max' if omitted (per NVIDIA's own model
+      // card) — the same trap that caused Kimi's 504s. Deliberately NOT
+      // tied to the global enableThinking toggle for the same reason:
+      // defaults to 'low', only escalates on an explicit per-request
+      // override.
+      //
+      // clear_thinking defaults to false in GLM-5.3's chat template.
+      // NVIDIA's own model card explicitly recommends passing
+      // clear_thinking: true for chat scenarios specifically (as opposed to
+      // single-shot completions) — which is what this proxy serves.
+      return {
+        chat_template_kwargs: { clear_thinking: true },
+        reasoning_effort: effort || 'low'
+      };
     }
 
     default:
