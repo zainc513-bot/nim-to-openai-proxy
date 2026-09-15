@@ -1,5 +1,6 @@
 // server.js — OpenAI-compatible proxy for NVIDIA NIM
-// Reasoning payload logic: reasoning.js. Tool-call leak recovery: tools.js.
+// Express 5 compatible. Reasoning-payload logic lives in reasoning.js,
+// tool-call leak recovery lives in tools.js.
 
 const express = require('express');
 const cors = require('cors');
@@ -13,7 +14,7 @@ const { extractLeakedToolCalls, ToolCallStreamRecovery } = require('./tools');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Configuration ──────────────────────────────────────────────────────
+// ─── Configuration ───────────────────────────────────────────────────────────
 
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
@@ -22,26 +23,45 @@ const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-// Verbose logging: reasoning payload per fallback attempt, full request/error bodies on failure.
+// DEBUG_MODE=true enables verbose logging: the reasoning payload sent on
+// each fallback attempt, plus the full request body and upstream error
+// response whenever an attempt fails.
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
 const MAX_TOKENS_LIMIT = 65536;
 
-// Shared keep-alive agent for connection reuse on long-lived deployments.
+// Reused across every outbound request to NIM. On a long-lived process
+// (Render, Railway, a VPS, etc.) this lets repeated requests reuse an
+// existing TCP/TLS connection instead of paying handshake cost every time.
+// Has no meaningful effect on serverless platforms where the process
+// itself doesn't persist between invocations — the win here is specific to
+// persistent deployments.
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
   maxSockets: 50,
   maxFreeSockets: 10
 });
 
+// Dedicated axios instance for all upstream NIM calls, wired to the shared
+// keep-alive agent above. Anything hitting NIM_API_BASE should go through
+// this instead of bare axios so connection reuse actually applies.
 const nim = axios.create({
   baseURL: NIM_API_BASE,
   httpsAgent: keepAliveAgent
 });
 
-// Per-attempt timeout before falling back to the next model. Reasoning
-// models get a longer window since thinking delays first-token latency.
-// Check these against your platform's own request duration limit.
+// Time-to-first-byte ceiling for a model attempt before it's treated as
+// failed and the fallback chain moves to the next model. Reasoning models
+// get a longer allowance since "thinking" before the first token can
+// legitimately take much longer than a small fast model — a single shared
+// timeout would misread a slow-but-working reasoning attempt as failed and
+// demote it to a weaker fallback that never even tried to think.
+//
+// Both values are env-configurable, but check them against your deployment
+// platform's own function/request duration limit before raising them — a
+// timeout set longer than the platform allows just means the platform kills
+// the request first, regardless of what's configured here (e.g. serverless
+// platforms commonly cap function duration well under 10 minutes by default).
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 180000;
 const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
 const VALIDATION_TIMEOUT_MS = 15000;
@@ -50,7 +70,7 @@ const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 if (DEBUG_MODE) console.log('[CONFIG] Debug mode: ENABLED (verbose reasoning + fallback logging)');
 
-// ─── Config validation ──────────────────────────────────────────────────
+// ─── Config validation ──────────────────────────────────────────────────────
 
 function validateConfig() {
   const fatal = (msg) => { console.error(`[FATAL] ${msg}`); process.exit(1); };
@@ -61,51 +81,75 @@ function validateConfig() {
 }
 validateConfig();
 
-// ─── Model Mapping ───────────────────────────────────────────────────────
+// ─── Model Mapping ─────────────────────────────────────────────────────────
 
-// Aliases are periodically re-checked against NIM's live catalog (see
-// validateModels() and GET /v1/models?live=true). Comments note the prior
-// backend model ID where an entry was swapped out for a dead catalog entry.
+// Model aliases are periodically re-checked against NIM's live catalog (see
+// validateModels() below and GET /v1/models?live=true). An alias pointing
+// at a backend NVIDIA has since dropped from the catalog burns a guaranteed
+// failed attempt on every request that uses it before falling through to
+// FALLBACK_MODELS — so keeping this mapping current is a latency concern,
+// not just a correctness one. Each swapped line below notes what it
+// replaced, where relevant.
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
-  'gpt-3.5': 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', // was qwen/qwen3.5-397b-a17b
+  'gpt-3.5': 'nvidia/nemotron-3-nano-30b-a3b', // was qwen/qwen3.5-397b-a17b — pulled from catalog
   'gpt-4-turbo': 'moonshotai/kimi-k3',
-  'claude-3-opus': 'google/diffusiongemma-26b-a4b-it',
+  'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'nvidia/llama-3.1-nemotron-70b-instruct', // was nvidia/llama-3.3-nemotron-super-49b-v1.5
-  'gemini-turbo': 'nvidia/llama3-chatqa-1.5-70b', // was meta/llama-3.3-70b-instruct
-  'gpt-3.5o': 'nvidia/nemotron-3.5-lightning-30b-a3b', // was google/gemma-2b
+  'gemini-pro': 'nvidia/llama-3.1-nemotron-70b-instruct', // was nvidia/llama-3.3-nemotron-super-49b-v1.5 — pulled from catalog
+  'gemini-turbo': 'nvidia/llama3-chatqa-1.5-70b', // was meta/llama-3.3-70b-instruct — pulled from catalog
+  'gpt-3.5o': 'google/gemma-2b', // was nvidia/nemotron-mini-4b-instruct — pulled from catalog
   'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash-0731',
   'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
-  'mistral': 'mistralai/mistral-large-2-instruct', // was mistralai/mistral-large-3-675b-instruct-2512
-  'mistral-turbo': 'nv-mistralai/mistral-nemo-12b-instruct', // was mistralai/mistral-medium-3.5-128b
-  'mistral-pro': 'mistralai/mistral-7b-instruct-v0.3', // was mistralai/mistral-small-4-119b-2603
+  'mistral': 'mistralai/mistral-large-2-instruct', // was mistralai/mistral-large-3-675b-instruct-2512 — pulled from catalog
+  'mistral-turbo': 'nv-mistralai/mistral-nemo-12b-instruct', // was mistralai/mistral-medium-3.5-128b — pulled from catalog
+  'mistral-pro': 'mistralai/mistral-7b-instruct-v0.3', // was mistralai/mistral-small-4-119b-2603 — pulled from catalog
   'mistral-nemo': 'mistralai/mistral-nemotron',
-  'mistral-fast': 'nvidia/mistral-nemo-minitron-8b-8k-instruct', // was mistralai/ministral-14b-instruct-2512
+  'mistral-fast': 'nvidia/mistral-nemo-minitron-8b-8k-instruct', // was mistralai/ministral-14b-instruct-2512 — pulled from catalog
   'google-light': 'google/gemma-4-31b-it',
-  'google-lightest': 'meta/muse-glimmer-30b', // was google/gemma-2b
-  'google-lighter': 'poolside/laguna-xs-2.1', // was google/gemma-3-4b-it
+  'google-lightest': 'google/gemma-2b', // was google/gemma-2-2b-it — pulled from catalog (naming changed too, no "-it" variant of gemma-2 live anymore)
+  'google-lighter': 'google/gemma-3-4b-it', // was google/gemma-3n-e4b-it — pulled from catalog
   'm3': 'minimaxai/minimax-m3'
+  // A few previously-defined aliases were removed because their backend
+  // models are no longer in NIM's catalog and had no live equivalent to
+  // fall back to: 'gemini-turbo?' (a stray key, likely an accidental
+  // duplicate/test entry), 'm2.7' (superseded by 'm3', which already
+  // covers the only live MiniMax model), and 'step-3.5-flash' /
+  // 'step-3.7-flash' (stepfun-ai currently has zero live models on NIM).
 };
 
-// Used when an unrecognized alias is requested. Must point at a live model.
+// Used when an unrecognized alias is requested. Must point at a live
+// model — an unmapped alias landing on a dead default silently eats a
+// guaranteed failed attempt before ever reaching FALLBACK_MODELS.
 const DEFAULT_MODEL = 'google/gemma-4-31b-it';
 
-// Ordered by observed reliability/speed — an early failing model delays every fallback behind it.
+// Ordered by empirically observed reliability/speed, not just "any live
+// model." A model earlier in this list that's currently failing (rate
+// limited, timing out, etc.) delays every fallback behind it, so the
+// fastest/most-reliable known-good model should go first.
 const FALLBACK_MODELS = [
-  'google/diffusiongemma-26b-a4b-it',
-  'google/gemma-4-31b-it',
-  'mistralai/mistral-nemotron',
-  'nvidia/nemotron-3-super-120b-a12b'
+  'moonshotai/kimi-k3',
+  'deepseek-ai/deepseek-v4-pro-0813',
+  'deepseek-ai/deepseek-v4-flash-0731',
+  'minimaxai/minimax-m3'
 ];
 
-// ─── Middleware ─────────────────────────────────────────────────────────
+// ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
+// Set high since some long-context models in this mapping support up to
+// ~1M tokens, and a realistic conversation history can approach that size
+// once JSON-encoded. Note that some serverless platforms enforce their own
+// hard request-body cap at the infrastructure level regardless of this
+// setting (e.g. Vercel caps at 4.5 MB and isn't configurable from app code)
+// — check your platform's limits if you expect genuinely large payloads.
 app.use(express.json({ limit: '50mb' }));
 
-// Malformed JSON body -> clean OpenAI-style error instead of Express's default HTML error page.
+// Catch malformed JSON bodies so clients get a clean OpenAI-style error
+// instead of Express's default HTML error page. Without this, a broken
+// request body never reaches the route handler's try/catch at all — Express
+// throws during body parsing, before routing happens.
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
     return res.status(400).json({
@@ -119,6 +163,11 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
+// Extract token AFTER "Bearer " prefix, compare only the token. Uses
+// startsWith + slice rather than split(' ') — split produces the wrong
+// array length (and silently rejects an otherwise-valid header) on anything
+// but exactly one space, e.g. "Bearer  <token>" with a doubled space or
+// trailing whitespace on the token itself.
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
   const trimmed = authHeader.trim();
@@ -165,9 +214,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Validation ─────────────────────────────────────────────────────────
+// ─── Validation ─────────────────────────────────────────────────────────────
 
-// Shared by startup validateModels() and GET /v1/models?live=true.
+// Fetches the live set of model IDs currently in NIM's catalog. Shared by
+// the startup validateModels() check and the GET /v1/models?live=true route
+// below, so there's one implementation of "ask NIM what's actually there"
+// instead of two that can quietly drift apart.
 async function fetchLiveModelIds() {
   const response = await nim.get('/models', {
     headers: {
@@ -207,7 +259,7 @@ async function validateModels() {
     }
   } catch (err) {
     console.warn(`[VALIDATION] /v1/models endpoint failed: ${err.message}. Skipping validation.`);
-    console.warn('[VALIDATION] Set SKIP_VALIDATION=true if your NIM provider lacks a model listing endpoint.');
+    console.warn('[VALIDATION] Consider setting SKIP_VALIDATION=true if your NIM provider lacks a model listing endpoint.');
   }
 }
 
@@ -237,7 +289,7 @@ async function sendDiscordAlert(invalidModels) {
   }
 }
 
-// ─── Helper: Safe Stream Writing ─────────────────────────────────────────
+// ─── Helper: Safe Stream Writing ───────────────────────────────────────────
 
 function safeWrite(res, data) {
   try {
@@ -251,9 +303,15 @@ function safeWrite(res, data) {
   return false;
 }
 
-// ─── Helper: Fallback Chain ──────────────────────────────────────────────
+// ─── Helper: Fallback Chain ─────────────────────────────────────────────────
 
-// Per-model cooldown after a 403/429, in-memory (resets on restart, not shared across instances).
+// In-memory per-model cooldown tracker. A model that just came back 429
+// (rate limited) or 403 (access tier the current key doesn't have) is
+// skipped for a window on subsequent requests, instead of every incoming
+// request re-discovering "this model doesn't work right now" the hard way
+// via its own failed attempt and timeout. Deliberately in-process rather
+// than shared/persisted — resets on restart, and doesn't coordinate across
+// multiple instances if you ever run more than one.
 const modelCooldowns = new Map(); // model -> timestamp (ms) until which to skip it
 
 const RATE_LIMIT_COOLDOWN_MS = Number(process.env.RATE_LIMIT_COOLDOWN_MS) || 30000;
@@ -268,19 +326,36 @@ function setCooldown(model, ms) {
   modelCooldowns.set(model, Date.now() + ms);
 }
 
+// Some backend models enforce fixed sampling parameters and reject requests
+// carrying different values with a hard 400 — not a soft ignore. Per
+// NVIDIA/Moonshot's own docs, Kimi-K3 requires temperature=1.0, top_p=0.95,
+// n=1, presence_penalty=0, frequency_penalty=0, and states these should be
+// omitted from requests entirely rather than sent as different values.
+// baseRequest always carries temperature (defaulted to 0.7 below in the
+// route handler) for every model, which is exactly what was triggering the
+// instant 400s on Kimi. Keyed by backend model ID; only forces the params a
+// given model is documented to require, model.
+const FIXED_SAMPLING_PARAMS = {
+  'moonshotai/kimi-k3': { temperature: 1.0, top_p: 0.95, n: 1, presence_penalty: 0, frequency_penalty: 0 }
+};
+
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
   const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
     ? REASONING_REQUEST_TIMEOUT_MS
     : REQUEST_TIMEOUT_MS;
 
-  // Skip cooling-down models; fall back to the full list if that empties the chain.
+  // Skip models currently in cooldown from a recent 403/429. If that would
+  // empty the chain entirely (e.g. everything's temporarily rate limited),
+  // fall back to the original full list rather than failing outright — a
+  // stale cooldown shouldn't be worse than never having tried.
   const activeModels = models.filter(m => !isInCooldown(m));
   const attemptOrder = activeModels.length > 0 ? activeModels : models;
 
   for (const model of attemptOrder) {
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
-    const fullRequest = { ...baseRequest, model, ...reasoningPayload };
+    const fixedParams = FIXED_SAMPLING_PARAMS[model] || {};
+    const fullRequest = { ...baseRequest, model, ...reasoningPayload, ...fixedParams };
 
     if (DEBUG_MODE) {
       console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
@@ -309,22 +384,31 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
         status,
         err.response?.data?.error?.message || err.message
       );
+      // Full request body + full upstream error, not just the one-line
+      // message above — useful for spotting a bad payload shape quickly.
       if (DEBUG_MODE) {
         console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
         console.log(`[DEBUG] Full upstream error response:`, JSON.stringify(err.response?.data || null));
       }
 
-      // Same key for every attempt: a 401 means every remaining model would fail identically.
+      // Every model attempt uses the same NIM_API_KEY, so a 401 here means
+      // the key itself is invalid — every remaining model is guaranteed to
+      // fail the same way. Abort the whole chain immediately instead of
+      // paying out the timeout on each one in turn.
       if (status === 401) {
         throw err;
       }
 
-      // 403: likely an access-tier issue, not a dead key — cooldown just this model.
+      // 403 usually means this specific model needs an access tier the
+      // current key doesn't have, not that the key is dead outright —
+      // cooldown just this model and keep going through the chain.
       if (status === 403) {
         setCooldown(model, ACCESS_DENIED_COOLDOWN_MS);
       }
 
-      // 429: rate limited — short cooldown.
+      // 429: this model specifically is rate limited right now. Short
+      // cooldown so the next several requests skip past it during the
+      // limited window instead of each eating a failed attempt.
       if (status === 429) {
         setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
       }
@@ -334,9 +418,13 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
   throw lastError || new Error('All models failed');
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────
+// ─── Routes ────────────────────────────────────────────────────────────────
 
-// Prevents a bare 403 (from the auth middleware) on root URL hits from a browser.
+// Without this route, visiting the base URL in a browser hits the auth
+// middleware below (which a browser can't pass, since it sends no
+// Authorization header) and returns a bare 403 — easy to mistake for "the
+// proxy is down." This route just confirms it's up and points to the real
+// endpoints.
 app.get('/', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html lang="en">
@@ -385,19 +473,28 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/v1/models', async (req, res) => {
+  // Default: static list, no network round trip. Kept fast so clients that
+  // ping this route on startup aren't affected by the live check's latency.
   if (req.query.live !== 'true') {
     return res.json({
       object: 'list',
       data: Object.keys(MODEL_MAPPING).map(id => ({
         id,
         object: 'model',
-        created: Math.floor(Date.now() / 1000), // OpenAI spec expects Unix seconds
+        // OpenAI's spec documents this field in Unix seconds, not milliseconds
+        // — Date.now() alone is 1000x too large and inconsistent with the
+        // correctly-converted timestamp used below in the chat completions
+        // response.
+        created: Math.floor(Date.now() / 1000),
         owned_by: 'nim-proxy'
       }))
     });
   }
 
-  // Cross-checks every alias against NIM's live catalog on demand.
+  // ?live=true cross-checks every alias's backend model ID against NIM's
+  // current catalog on demand, instead of only at startup (validateModels())
+  // or discovering a deprecated model ID by accident on the next chat
+  // request, when it would silently fall through to FALLBACK_MODELS.
   try {
     const availableModels = await fetchLiveModelIds();
     const data = Object.entries(MODEL_MAPPING).map(([id, backend]) => ({
@@ -442,11 +539,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       primaryModel = DEFAULT_MODEL;
     }
 
-    // De-dupe: avoids retrying the same model twice if it's also in FALLBACK_MODELS.
+    // De-dupe in case the requested alias resolves to a model that's also in
+    // the fallback chain — otherwise a failure retries the identical model
+    // twice before actually diversifying.
     const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
 
-    // Forward all client fields except model (replaced per-attempt) and
-    // reasoning_effort (translated per-model by getReasoningPayload).
+    // Forward every field the client sent (top_p, stop, seed, tools,
+    // tool_choice, response_format, etc.) rather than a narrow whitelist, so
+    // nothing a client relies on silently vanishes. `model` and
+    // `reasoning_effort` are excluded on purpose: model gets replaced
+    // per-attempt below, and reasoning_effort is translated into the correct
+    // per-model shape by getReasoningPayload() — forwarding the raw value too
+    // would leak a redundant/conflicting field alongside the translated one.
     const { model: _droppedModel, reasoning_effort: _droppedReasoningEffort, ...forwardedFields } = req.body;
 
     const baseRequest = {
@@ -467,6 +571,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
 
+    // Determine if the client wants legacy inline <thinking> tags in the content stream
     const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
     if (stream) {
@@ -480,6 +585,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       let doneSent = false;
       let cleanedUp = false;
       const normalizer = new StreamNormalizer(usedModel);
+      // See tools.js — catches models (GLM-5.2, nemotron-3-super confirmed)
+      // that leak tool calls into content as a raw <tool_call> tag instead
+      // of NIM's structured tool_calls field.
       const toolRecovery = new ToolCallStreamRecovery();
 
       const cleanup = () => {
@@ -494,8 +602,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       const processLine = (line) => {
         if (!line.startsWith('data: ')) return;
 
-        // Exact match avoids false-positiving on model output that happens
-        // to contain the literal substring "[DONE]".
+        // Exact match only. .includes() would false-positive on any legitimate
+        // model output that happens to contain the literal substring "[DONE]"
+        // in its generated content (e.g. a coding/task-tracking response),
+        // silently truncating the reply right there.
         if (line.trim() === 'data: [DONE]') {
           if (!doneSent) {
             safeWrite(res, 'data: [DONE]\n\n');
@@ -514,6 +624,8 @@ app.post('/v1/chat/completions', async (req, res) => {
             let clientContent = '';
 
             if (SHOW_REASONING && inlineReasoning) {
+              // Inline reasoning format: bake <thinking> tags into content
+              // for clients that don't parse structured reasoning fields.
               if (normalizedDelta.reasoning && !reasoningOpen) {
                 clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
                 reasoningOpen = true;
@@ -528,18 +640,34 @@ app.post('/v1/chat/completions', async (req, res) => {
                 clientContent += normalizedDelta.content;
               }
             } else {
+              // Default behavior: clean content, no inline tags
               clientContent = normalizedDelta.content || '';
             }
 
+            // Recover tool calls the backend leaked into content as a raw
+            // <tool_call> tag instead of a structured field (confirmed
+            // upstream bug — see tools.js). Must run on the
+            // final clientContent (post reasoning-split, post inline-tag
+            // formatting) since that's the actual text stream being built.
             const { content: recoveredContent, toolCallDeltas } = toolRecovery.process(clientContent);
             clientContent = recoveredContent;
             if (toolCallDeltas.length > 0) {
               delta.tool_calls = toolCallDeltas;
+              // Force the signal even if upstream's own finish_reason on this
+              // chunk was null/'stop' — a recovered tool call means the
+              // model's actual intent was a tool_calls turn, and
+              // OpenAI-compatible clients key off this field to decide
+              // whether to execute a tool vs. treat the turn as finished prose.
               if (data.choices[0]) data.choices[0].finish_reason = 'tool_calls';
             }
 
             delta.content = clientContent;
 
+            // Keep a structured reasoning field alongside inline tags in
+            // content. Some clients parse the inline <thinking> tags;
+            // others (OpenRouter-style apps) look for a separate
+            // `reasoning`/`reasoning_content` field to render their own
+            // collapsible thinking UI. Send both so either style works.
             if (SHOW_REASONING && normalizedDelta.reasoning) {
               delta.reasoning = normalizedDelta.reasoning;
               delta.reasoning_content = normalizedDelta.reasoning;
@@ -597,6 +725,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         const flushedDelta = normalizer.flush();
 
+        // Stream ended while still mid <tool_call> tag (e.g. cut off by
+        // max_tokens before the closing tag arrived). Surface the raw
+        // partial tag as text rather than silently dropping it.
         const toolRecoveryLeftover = toolRecovery.flush();
         if (toolRecoveryLeftover) {
           console.warn('[TOOL_CALL_RECOVERY] Stream ended mid <tool_call> tag; flushing raw text instead of dropping it.');
@@ -607,6 +738,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           let clientContent = '';
 
           if (SHOW_REASONING && inlineReasoning) {
+            // Inline reasoning format: bake <thinking> tags into content.
             if (flushedDelta.reasoning && !reasoningOpen) {
               clientContent += `<thinking>\n${flushedDelta.reasoning}`;
               reasoningOpen = true;
@@ -621,12 +753,17 @@ app.post('/v1/chat/completions', async (req, res) => {
               clientContent += flushedDelta.content;
             }
           } else {
+            // Default behavior: clean content, no inline tags
             clientContent = flushedDelta.content || '';
           }
 
           const finalChunk = { choices: [{ delta: {} }] };
           if (clientContent) finalChunk.choices[0].delta.content = clientContent;
 
+          // Mirror the per-chunk handling above: leftover reasoning text
+          // must also reach structured-format clients, not just get folded
+          // into inline tags. Previously this was dropped entirely whenever
+          // SHOW_REASONING was on but inlineReasoning was off.
           if (SHOW_REASONING && !inlineReasoning && flushedDelta.reasoning) {
             finalChunk.choices[0].delta.reasoning = flushedDelta.reasoning;
             finalChunk.choices[0].delta.reasoning_content = flushedDelta.reasoning;
@@ -637,7 +774,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         }
 
-        // Close an inline <thinking> tag left open if the model was cut off mid-reasoning.
+        // A model can get cut off mid-reasoning (e.g. hits max_tokens while
+        // still inside a <think> block, never emitting the closing tag).
+        // If we opened an inline <thinking> tag earlier and nothing above
+        // closed it, close it now so inline-format clients aren't left with
+        // an unterminated tag.
         if (SHOW_REASONING && inlineReasoning && reasoningOpen) {
           safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: '\n</thinking>\n' } }] })}\n\n`);
           reasoningOpen = false;
@@ -679,20 +820,27 @@ app.post('/v1/chat/completions', async (req, res) => {
         cleanup();
       });
     } else {
+      // Non-streaming response
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
-        model: usedModel, // actual model that answered, may differ from the requested alias
+        // Report the model that actually answered (which may differ from the
+        // requested alias if a fallback kicked in), not the raw client input.
+        model: usedModel,
         created: Math.floor(Date.now() / 1000),
         choices: (response.data.choices || []).map((choice, i) => {
           const normalizedChoice = normalizeNonStreamChoice(choice, usedModel);
           let content = normalizedChoice.message?.content || '';
           const reasoning = normalizedChoice.message?.reasoning || '';
 
+          // Recover tool calls the backend leaked into content as a raw
+          // <tool_call> tag instead of NIM's structured tool_calls field
+          // (confirmed upstream bug — see tools.js).
           const { content: cleanedContent, toolCalls: recoveredToolCalls } = extractLeakedToolCalls(content);
           content = cleanedContent;
 
           if (SHOW_REASONING && inlineReasoning && reasoning) {
+            // Inline reasoning format: bake <thinking> tags into content.
             content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
           }
 
@@ -703,12 +851,18 @@ app.post('/v1/chat/completions', async (req, res) => {
               ...(normalizedChoice.message?.tool_calls || []),
               ...recoveredToolCalls
             ];
-            // null content on tool-call turns matches real OpenAI responses
+            // A present-but-whitespace-only content string alongside
+            // tool_calls trips up some client-side agent loops that expect
+            // null content on a tool-call turn (mirrors real OpenAI
+            // tool-call responses, which always send content: null).
             if (!finalMessage.content || !finalMessage.content.trim()) {
               finalMessage.content = null;
             }
           }
 
+          // Same as the streaming path: keep the structured field alongside
+          // the inline tags so structured-reasoning clients can render their
+          // own UI.
           if (SHOW_REASONING && reasoning) {
             finalMessage.reasoning = reasoning;
             finalMessage.reasoning_content = reasoning;
@@ -739,8 +893,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.error('[PROXY] NIM response:', error.response?.data);
 
     if (!res.headersSent) {
-      // Express only sets Content-Type if unset; force JSON in case the
-      // streaming branch already set text/event-stream before failing.
+      // If this fires after the streaming branch already called
+      // res.setHeader('Content-Type', 'text/event-stream') but before any
+      // actual write, res.json() below won't override it — Express's
+      // res.json() only sets Content-Type when it isn't already set. Force
+      // it back to JSON explicitly so the error body's declared type
+      // actually matches its content.
       res.set('Content-Type', 'application/json');
       res.status(error.response?.status || 500).json({
         error: {
@@ -776,7 +934,7 @@ app.use((req, res) => {
   });
 });
 
-// ─── Startup ──────────────────────────────────────────────────────────────
+// ─── Startup ───────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
