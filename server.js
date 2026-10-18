@@ -106,9 +106,10 @@ const DEFAULT_MODEL = 'google/diffusiongemma-26b-a4b-it';
 
 // Ordered by observed reliability/speed — an early failing model delays every fallback behind it.
 const FALLBACK_MODELS = [
-  'deepseek-ai/deepseek-v4.1-flash',
-  'z-ai/glm-5.3',
-  'z-ai/glm-5-3-flash'
+  'google/diffusiongemma-26b-a4b-it',
+  'google/gemma-4-31b-it',
+  'mistralai/mistral-nemotron',
+  'nvidia/nemotron-3-super-120b-a12b'
 ];
 
 // ─── Middleware ─────────────────────────────────────────────────────────
@@ -231,8 +232,8 @@ async function sendDiscordAlert(invalidModels) {
     color: 0xff4444,
     timestamp: new Date().toISOString(),
     fields: invalidModels.map(m => ({
-      name: `\\`${m.alias}\\``,
-      value: `Backend: \\`${m.nimId}\\`\nError: \\`${m.error}\\``,
+      name: `\`${m.alias}\``,
+      value: `Backend: \`${m.nimId}\`\nError: \`${m.error}\``,
       inline: true
     }))
   };
@@ -294,7 +295,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
 
     if (DEBUG_MODE) {
-      console.log(`[DEBUG] Attempting \${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: \${timeoutMs}ms)`);
+      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
     }
 
     try {
@@ -303,7 +304,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
         fullRequest,
         {
           headers: {
-            Authorization: `Bearer \${NIM_API_KEY}`,
+            Authorization: `Bearer ${NIM_API_KEY}`,
             'Content-Type': 'application/json'
           },
           responseType: baseRequest.stream ? 'stream' : 'json',
@@ -316,12 +317,12 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       const status = err.response?.status;
 
       console.warn(
-        `[FALLBACK] Model failed: \${model}`,
+        `[FALLBACK] Model failed: ${model}`,
         status,
         err.response?.data?.error?.message || err.message
       );
       if (DEBUG_MODE) {
-        console.log(`[DEBUG] Full request body sent to \${model}:`, JSON.stringify(fullRequest));
+        console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
         console.log(`[DEBUG] Full upstream error response:`, JSON.stringify(err.response?.data || null));
       }
 
@@ -429,10 +430,10 @@ app.get('/v1/models', async (req, res) => {
       }
     });
   } catch (err) {
-    console.warn(`[MODELS] Live check failed: \${err.message}`);
+    console.warn(`[MODELS] Live check failed: ${err.message}`);
     res.status(502).json({
       error: {
-        message: `Live model check against NIM failed: \${err.message}`,
+        message: `Live model check against NIM failed: ${err.message}`,
         type: 'live_check_error',
         code: 502
       }
@@ -449,7 +450,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let primaryModel = MODEL_MAPPING[model];
     if (!primaryModel) {
-      console.warn(`[PROXY] Unknown model alias "\${model}", falling back to default: \${DEFAULT_MODEL}`);
+      console.warn(`[PROXY] Unknown model alias "${model}", falling back to default: ${DEFAULT_MODEL}`);
       primaryModel = DEFAULT_MODEL;
     }
 
@@ -526,14 +527,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             if (SHOW_REASONING && inlineReasoning) {
               if (normalizedDelta.reasoning && !reasoningOpen) {
-                clientContent += `<thinking>\n\${normalizedDelta.reasoning}`;
+                clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
                 reasoningOpen = true;
               } else if (normalizedDelta.reasoning) {
                 clientContent += normalizedDelta.reasoning;
               }
 
               if (normalizedDelta.content && reasoningOpen) {
-                clientContent += `\n</thinking>\n\n\${normalizedDelta.content}`;
+                clientContent += `\n</thinking>\n\n${normalizedDelta.content}`;
                 reasoningOpen = false;
               } else if (normalizedDelta.content) {
                 clientContent += normalizedDelta.content;
@@ -560,10 +561,10 @@ app.post('/v1/chat/completions', async (req, res) => {
             }
           }
 
-          safeWrite(res, `data: \${JSON.stringify(data)}\n\n`);
+          safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
         } catch {
           console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
-          safeWrite(res, `data: \${JSON.stringify({
+          safeWrite(res, `data: ${JSON.stringify({
             error: {
               message: 'Upstream sent malformed chunk',
               type: 'stream_parse_error',
@@ -578,7 +579,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         if (buffer.length > MAX_BUFFER_SIZE) {
           console.error('[STREAM] Buffer overflow, destroying connection');
-          safeWrite(res, `data: \${JSON.stringify({
+          safeWrite(res, `data: ${JSON.stringify({
             error: {
               message: 'Stream buffer overflow',
               type: 'stream_error'
@@ -619,14 +620,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
           if (SHOW_REASONING && inlineReasoning) {
             if (flushedDelta.reasoning && !reasoningOpen) {
-              clientContent += `<thinking>\n\${flushedDelta.reasoning}`;
+              clientContent += `<thinking>\n${flushedDelta.reasoning}`;
               reasoningOpen = true;
             } else if (flushedDelta.reasoning) {
               clientContent += flushedDelta.reasoning;
             }
 
             if (flushedDelta.content && reasoningOpen) {
-              clientContent += `\n</thinking>\n\n\${flushedDelta.content}`;
+              clientContent += `\n</thinking>\n\n${flushedDelta.content}`;
               reasoningOpen = false;
             } else if (flushedDelta.content) {
               clientContent += flushedDelta.content;
@@ -644,13 +645,13 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
 
           if (Object.keys(finalChunk.choices[0].delta).length > 0) {
-            safeWrite(res, `data: \${JSON.stringify(finalChunk)}\n\n`);
+            safeWrite(res, `data: ${JSON.stringify(finalChunk)}\n\n`);
           }
         }
 
         // Close an inline <thinking> tag left open if the model was cut off mid-reasoning.
         if (SHOW_REASONING && inlineReasoning && reasoningOpen) {
-          safeWrite(res, `data: \${JSON.stringify({ choices: [{ delta: { content: '\n</thinking>\n' } }] })}\n\n`);
+          safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: '\n</thinking>\n' } }] })}\n\n`);
           reasoningOpen = false;
         }
 
@@ -667,7 +668,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       upstreamStream.on('error', err => {
         console.error('[STREAM] Upstream error:', err.message);
         if (!res.writableEnded) {
-          safeWrite(res, `data: \${JSON.stringify({
+          safeWrite(res, `data: ${JSON.stringify({
             error: {
               message: 'Stream interrupted by upstream error',
               type: 'stream_error'
@@ -691,7 +692,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
     } else {
       const openaiResponse = {
-        id: `chatcmpl-\${Date.now()}`,
+        id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         model: usedModel, // actual model that answered, may differ from the requested alias
         created: Math.floor(Date.now() / 1000),
@@ -704,7 +705,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           content = cleanedContent;
 
           if (SHOW_REASONING && inlineReasoning && reasoning) {
-            content = `<thinking>\n\${reasoning}\n</thinking>\n\n\${content}`;
+            content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
           }
 
           const finalMessage = { ...normalizedChoice.message, content };
@@ -761,7 +762,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       });
     } else if (!res.writableEnded) {
-      safeWrite(res, `data: \${JSON.stringify({
+      safeWrite(res, `data: ${JSON.stringify({
         error: {
           message: error.message,
           type: 'proxy_error'
@@ -780,7 +781,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 app.use((req, res) => {
   res.status(404).json({
     error: {
-      message: `Endpoint \${req.method} \${req.path} not found`,
+      message: `Endpoint ${req.method} ${req.path} not found`,
       type: 'invalid_request_error',
       code: 404
     }
@@ -790,8 +791,8 @@ app.use((req, res) => {
 // ─── Startup ──────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log(`[PROXY] Hybrid proxy running on port \${PORT}`);
-  console.log(`[PROXY] Max tokens limit: \${MAX_TOKENS_LIMIT}`);
+  console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
+  console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
