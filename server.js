@@ -156,7 +156,7 @@ function safeTimingEqual(a, b) {
 }
 
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/v1/models' || req.path === '/') {
+  if (req.path === '/health' || req.path === '/v1/models' || req.path === '/' || req.path === '/test-model') {
     return next();
   }
 
@@ -864,6 +864,54 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (upstreamStream && !upstreamStream.destroyed) {
       upstreamStream.destroy();
     }
+  }
+});
+
+// Quick diagnostic: sends one tiny message to a model and reports timing + result.
+// Open in a browser: /test-model?key=YOUR_CLIENT_AUTH_KEY&model=gpt-4-flash
+// (model can be an alias like glm-5.3, or a full NIM id). Optional: &timeout=60
+app.get('/test-model', async (req, res) => {
+  const key = typeof req.query.key === 'string' ? req.query.key : '';
+  if (!CLIENT_AUTH_KEY || !safeTimingEqual(key, CLIENT_AUTH_KEY)) {
+    return res.status(403).json({ error: 'Add ?key=YOUR_CLIENT_AUTH_KEY to the URL' });
+  }
+
+  const requested = String(req.query.model || 'gpt-4-flash');
+  const modelId = MODEL_MAPPING[requested] || requested;
+  const timeoutMs = Math.min(Number(req.query.timeout) || 60, 120) * 1000;
+  const body = {
+    model: modelId,
+    messages: [{ role: 'user', content: 'Say hi in five words.' }],
+    max_tokens: 200,
+    stream: false,
+    ...getReasoningPayload(modelId, ENABLE_THINKING_MODE, undefined, false)
+  };
+
+  const started = Date.now();
+  try {
+    const r = await nim.post('/chat/completions', body, {
+      headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
+      timeout: timeoutMs
+    });
+    const msg = r.data?.choices?.[0]?.message || {};
+    res.json({
+      ok: true,
+      model: modelId,
+      seconds: ((Date.now() - started) / 1000).toFixed(1),
+      reply: msg.content || null,
+      reasoning_chars: (msg.reasoning_content || msg.reasoning || '').length,
+      finish_reason: r.data?.choices?.[0]?.finish_reason,
+      sent: body
+    });
+  } catch (err) {
+    res.json({
+      ok: false,
+      model: modelId,
+      seconds: ((Date.now() - started) / 1000).toFixed(1),
+      http_status: err.response?.status || null,
+      error: err.response?.data || err.message,
+      sent: body
+    });
   }
 });
 
