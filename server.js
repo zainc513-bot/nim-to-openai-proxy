@@ -46,7 +46,10 @@ const nim = axios.create({
 // Per-attempt timeout before falling back to the next model. Reasoning
 // models get a longer window since thinking delays first-token latency.
 // Check these against your platform's own request duration limit.
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 180000;
+// This is how long to wait for NIM to START answering (response headers). Keep it well
+// under the client's own limit (JanitorAI gives up around 2 minutes), otherwise a hung
+// model eats the whole window and the fallback never gets a chance to reply in time.
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 60000;
 const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
@@ -284,7 +287,7 @@ function setCooldown(model, ms) {
   modelCooldowns.set(model, Date.now() + ms);
 }
 
-async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
+async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools, signal) {
   let lastError = null;
   const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
     ? REASONING_REQUEST_TIMEOUT_MS
@@ -295,6 +298,11 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
   const attemptOrder = activeModels.length > 0 ? activeModels : models;
 
   for (const model of attemptOrder) {
+    // Client already gone: don't start more upstream calls nobody will read.
+    if (signal && signal.aborted) {
+      throw lastError || new Error('Client disconnected');
+    }
+
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
 
@@ -312,12 +320,19 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
             'Content-Type': 'application/json'
           },
           responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: timeoutMs
+          timeout: timeoutMs,
+          signal
         }
       );
       return { response: res, model };
     } catch (err) {
       lastError = err;
+
+      // Aborted because the client disconnected, not a model failure.
+      if (signal && signal.aborted) {
+        throw err;
+      }
+
       const status = err.response?.status;
 
       console.warn(
@@ -450,6 +465,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   let upstreamStream = null;
   let heartbeat = null;
   let streamStats = null;
+  const abortController = new AbortController();
 
   try {
     // For streaming requests, open the SSE response immediately and send
@@ -466,6 +482,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       heartbeat = setInterval(() => safeWrite(res, ': keep-alive\n\n'), HEARTBEAT_INTERVAL_MS);
       res.on('close', () => {
         clearInterval(heartbeat);
+        if (!streamEndedCleanly) abortController.abort();
         if (!streamEndedCleanly) {
           const s = streamStats;
           console.warn(
@@ -506,7 +523,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       modelChain,
       ENABLE_THINKING_MODE,
       reasoning_effort,
-      !!req.body.tools
+      !!req.body.tools,
+      abortController.signal
     );
 
     upstreamStream = response.data;
@@ -812,6 +830,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   } catch (error) {
     if (heartbeat) clearInterval(heartbeat);
+
+    if (abortController.signal.aborted) {
+      console.warn('[PROXY] Client left before any model answered; abandoned the fallback chain.');
+      return;
+    }
 
     console.error('[PROXY] Fatal error:', error.message);
     console.error('[PROXY] NIM response:', error.response?.data);
