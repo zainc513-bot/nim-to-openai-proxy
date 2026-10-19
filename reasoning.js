@@ -155,6 +155,7 @@ function normalizeNonStreamChoice(choice, model) {
 const REASONING_EFFORT_ENUMS = {
   'openai/gpt-oss-120b': ['low', 'medium', 'high'],
   'openai/gpt-oss-20b': ['low', 'medium', 'high'],
+  'deepseek-ai/deepseek-v4.1-flash': ['low', 'high', 'max'],
   'deepseek-ai/deepseek-v4-flash-0731': ['low', 'high', 'max'],
   'deepseek-ai/deepseek-v4-pro-0813': ['low', 'high', 'max'],
   'nvidia/nemotron-3-super-120b-a12b': ['low'],
@@ -221,6 +222,7 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return { reasoning_budget: NEMOTRON_LIGHTNING_BUDGET_MAP[effort] ?? 16384 };
     }
 
+    case 'deepseek-ai/deepseek-v4.1-flash':
     case 'deepseek-ai/deepseek-v4-flash-0731':
     case 'deepseek-ai/deepseek-v4-pro-0813': {
       if (!enableThinking) {
