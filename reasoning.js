@@ -161,6 +161,7 @@ const REASONING_EFFORT_ENUMS = {
   'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
+  'z-ai/glm-5.3': ['low', 'high', 'max'],
   'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
 };
 
@@ -239,11 +240,21 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return {};
     }
 
-    // GLM thinks by default when no flag is sent, which can burn the whole
-    // max_tokens budget on reasoning and leave empty visible content (clients
-    // like JanitorAI then show "network error"). Send the flag explicitly so
-    // thinking is only on when ENABLE_THINKING_MODE / reasoning_effort "on" says so.
-    case 'z-ai/glm-5.3':
+    // GLM-5.3 has NO non-thinking mode: its chat template ignores
+    // enable_thinking and instead takes reasoning_effort (low | high | max,
+    // default max). With the default 'max' it can reason for minutes before
+    // producing any visible text, which makes clients like JanitorAI time out
+    // ("network error"). So default to 'low'. The value is sent both top-level
+    // and inside chat_template_kwargs since NIM's accepted location isn't documented.
+    case 'z-ai/glm-5.3': {
+      const level = effort || (enableThinking ? 'high' : 'low');
+      return {
+        reasoning_effort: level,
+        chat_template_kwargs: { reasoning_effort: level }
+      };
+    }
+
+    // Older GLM generations (GLM-5.2 and earlier) use enable_thinking.
     case 'z-ai/glm-5-3-flash': {
       return { chat_template_kwargs: { enable_thinking: !!enableThinking } };
     }
