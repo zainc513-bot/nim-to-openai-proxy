@@ -239,6 +239,15 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return {};
     }
 
+    // GLM thinks by default when no flag is sent, which can burn the whole
+    // max_tokens budget on reasoning and leave empty visible content (clients
+    // like JanitorAI then show "network error"). Send the flag explicitly so
+    // thinking is only on when ENABLE_THINKING_MODE / reasoning_effort "on" says so.
+    case 'z-ai/glm-5.3':
+    case 'z-ai/glm-5-3-flash': {
+      return { chat_template_kwargs: { enable_thinking: !!enableThinking } };
+    }
+
     case 'google/gemma-4-31b-it': {
       if (!enableThinking) return {};
       return {

@@ -518,6 +518,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       let cleanedUp = false;
       const normalizer = new StreamNormalizer(usedModel);
       const toolRecovery = new ToolCallStreamRecovery();
+      const stats = { chunks: 0, contentChars: 0, reasoningChars: 0, finish: null, start: Date.now() };
 
       const cleanup = () => {
         if (cleanedUp) return;
@@ -546,9 +547,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         try {
           const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
+          stats.chunks++;
+          if (data.choices?.[0]?.finish_reason) stats.finish = data.choices[0].finish_reason;
 
           if (delta) {
             const normalizedDelta = normalizer.processDelta(delta);
+            stats.contentChars += (normalizedDelta.content || '').length;
+            stats.reasoningChars += (normalizedDelta.reasoning || '').length;
             let clientContent = '';
 
             if (SHOW_REASONING && inlineReasoning) {
@@ -683,6 +688,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         if (!doneSent) {
           safeWrite(res, 'data: [DONE]\n\n');
+        }
+        console.log(
+          `[STREAM] Finished (${usedModel}): ${stats.chunks} chunks, ` +
+          `${stats.contentChars} content chars, ${stats.reasoningChars} reasoning chars, ` +
+          `finish_reason=${stats.finish}, ${Date.now() - stats.start}ms`
+        );
+        if (stats.contentChars === 0) {
+          console.warn('[STREAM] Upstream produced NO visible content (reasoning may have used the whole token budget).');
         }
         streamEndedCleanly = true;
         if (!res.writableEnded) {
