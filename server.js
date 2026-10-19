@@ -27,6 +27,10 @@ const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
 const MAX_TOKENS_LIMIT = 65536;
 
+// How often to send an SSE comment while waiting on upstream, so proxies/clients
+// don't drop an idle streaming connection during long reasoning delays.
+const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS) || 10000;
+
 // Shared keep-alive agent for connection reuse on long-lived deployments.
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
@@ -444,8 +448,32 @@ app.get('/v1/models', async (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   let streamEndedCleanly = false;
   let upstreamStream = null;
+  let heartbeat = null;
 
   try {
+    // For streaming requests, open the SSE response immediately and send
+    // periodic comment lines while waiting on upstream. Without this, slow
+    // reasoning models (e.g. GLM-5.3) leave the client connection silent long
+    // enough for the platform edge / browser to drop it ("load failed").
+    if (req.body && req.body.stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+      safeWrite(res, ': connected\n\n');
+      heartbeat = setInterval(() => safeWrite(res, ': keep-alive\n\n'), HEARTBEAT_INTERVAL_MS);
+      res.on('close', () => {
+        clearInterval(heartbeat);
+        if (!streamEndedCleanly) {
+          console.warn('[STREAM] Client connection closed before stream finished');
+        }
+        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
+          upstreamStream.destroy();
+        }
+      });
+    }
+
     const { model, max_tokens, temperature, stream, reasoning_effort } = req.body;
 
     let primaryModel = MODEL_MAPPING[model];
@@ -482,10 +510,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
     if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
+      // Headers were already sent above (SSE headers + heartbeat).
       const decoder = new StringDecoder('utf8');
       let buffer = '';
       let reasoningOpen = false;
@@ -497,6 +522,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const cleanup = () => {
         if (cleanedUp) return;
         cleanedUp = true;
+        if (heartbeat) clearInterval(heartbeat);
         if (upstreamStream) {
           upstreamStream.removeAllListeners();
         }
@@ -747,6 +773,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.json(openaiResponse);
     }
   } catch (error) {
+    if (heartbeat) clearInterval(heartbeat);
+
     console.error('[PROXY] Fatal error:', error.message);
     console.error('[PROXY] NIM response:', error.response?.data);
 
