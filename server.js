@@ -83,7 +83,9 @@ const MODEL_MAPPING = {
   'gemini-pro': 'nvidia/llama-3.1-nemotron-70b-instruct', 
   'gemini-turbo': 'nvidia/llama3-chatqa-1.5-70b',
   'gpt-3.5o': 'nvidia/nemotron-3.5-lightning-30b-a3b',
-  'gpt-4-flash': 'deepseek-ai/deepseek-v4.1-flash',
+  // DeepSeek v4.1 Flash was timing out on NIM even for a tiny request (checked via /test-model).
+  // To restore it, swap this back to 'deepseek-ai/deepseek-v4.1-flash'.
+  'gpt-4-flash': 'z-ai/glm-5.3-flash',
   'gpt-4o': 'stepfun-ai/step-5-preview',
   'mistral': 'mistralai/mistral-large-2-instruct', 
   'mistral-turbo': 'nv-mistralai/mistral-nemo-12b-instruct',
@@ -115,7 +117,7 @@ const DEFAULT_MODEL = 'google/diffusiongemma-26b-a4b-it';
 const FALLBACK_MODELS = [
   'z-ai/glm-5.3',
   'z-ai/glm-5.3-flash',
-  'deepseek-ai/deepseek-v4.1-flash',
+  // 'deepseek-ai/deepseek-v4.1-flash', // removed: not responding on NIM, see MODEL_MAPPING note
   'nvidia/nemotron-3-super-120b-a12b'
 ];
 
@@ -156,7 +158,7 @@ function safeTimingEqual(a, b) {
 }
 
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/v1/models' || req.path === '/' || req.path === '/test-model') {
+  if (req.path === '/health' || req.path === '/v1/models' || req.path === '/' || req.path === '/test' || req.path === '/test-model') {
     return next();
   }
 
@@ -867,13 +869,363 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
+// ─── Test page ──────────────────────────────────────────────────────────
+// Served at /test. The page itself exposes nothing; every call it makes uses your
+// key from the browser (stored in localStorage only, never in the URL).
+// NOTE: the client script below must not contain backticks or ${...}, since it lives
+// inside a JS template string.
+const TEST_PAGE_HTML = String.raw`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proxy tester</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#0b0f14; --card:#11161d; --line:#222b36; --text:#e6edf3; --dim:#9aa7b2; --ok:#7ee787; --bad:#ff7b72; --warn:#e3b341; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; line-height:1.5; }
+  main { max-width:760px; margin:0 auto; padding:20px 16px 60px; }
+  h1 { font-size:1.3rem; margin:0 0 4px; }
+  h2 { font-size:1rem; margin:0 0 4px; }
+  .sub { color:var(--dim); margin:0 0 14px; font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  label { display:block; font-size:.8rem; color:var(--dim); margin:10px 0 4px; }
+  input, select, textarea { width:100%; background:#0b0f14; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px; font-size:16px; font-family:inherit; }
+  textarea { min-height:90px; resize:vertical; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .row > div { flex:1 1 160px; }
+  button { background:var(--ok); color:#06210d; border:0; border-radius:8px; padding:10px 16px; font-size:16px; font-weight:600; cursor:pointer; margin:12px 8px 0 0; }
+  button.secondary { background:transparent; color:var(--text); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  pre.out { white-space:pre-wrap; word-wrap:break-word; background:#0b0f14; border:1px solid var(--line); border-radius:8px; padding:12px; min-height:56px; margin:12px 0 0; font-family:inherit; font-size:.95rem; }
+  .stats { color:var(--dim); font-size:.85rem; margin-top:8px; word-wrap:break-word; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; margin-top:12px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; word-break:break-word; }
+  th { color:var(--dim); font-weight:500; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  details { margin-top:10px; color:var(--dim); }
+  summary { cursor:pointer; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Proxy tester</h1>
+  <p class="sub">Try models through your proxy. Your key is kept only in this browser.</p>
+
+  <div class="card">
+    <h2>Connection <span id="health" class="stats"></span></h2>
+    <label for="key">CLIENT_AUTH_KEY</label>
+    <input id="key" type="password" autocomplete="off" placeholder="Paste your key once">
+  </div>
+
+  <div class="card">
+    <h2>Chat test</h2>
+    <p class="sub">Streams a real reply the way Janitor does, including model fallback.</p>
+    <div class="row">
+      <div><label for="model">Model</label><select id="model"></select></div>
+      <div><label for="effort">Reasoning</label>
+        <select id="effort">
+          <option value="">Proxy default</option>
+          <option value="off">off</option>
+          <option value="on">on</option>
+          <option value="low">low</option>
+          <option value="high">high</option>
+          <option value="max">max</option>
+        </select>
+      </div>
+      <div><label for="maxtok">Max tokens</label><input id="maxtok" type="number" value="1024" min="1" max="65536"></div>
+    </div>
+    <label for="prompt">Message</label>
+    <textarea id="prompt">Write a short two-sentence story about a lighthouse keeper.</textarea>
+    <button id="send">Send</button><button id="stop" class="secondary" disabled>Stop</button>
+    <div id="stats" class="stats"></div>
+    <pre id="reply" class="out"></pre>
+    <details id="rdet" hidden><summary>Reasoning</summary><pre id="reasoning" class="out"></pre></details>
+  </div>
+
+  <div class="card">
+    <h2>Model check</h2>
+    <p class="sub">Sends a tiny message straight to NIM with no fallback, so a broken model can't hide.</p>
+    <label for="checkModel">Full NIM model ID (optional, otherwise uses the model chosen above)</label>
+    <input id="checkModel" placeholder="e.g. z-ai/glm-5.3">
+    <button id="checkOne">Check one model</button><button id="checkAll" class="secondary">Check all models</button>
+    <div id="checkOut" class="stats"></div>
+  </div>
+</main>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var KEY_STORE = 'proxyTesterKey';
+  var MODEL_STORE = 'proxyTesterModel';
+
+  function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function key() { return $('key').value.trim(); }
+  function fmt(ms) { return (ms / 1000).toFixed(1) + 's'; }
+  function authHeaders(extra) {
+    var h = { 'Authorization': 'Bearer ' + key() };
+    for (var k in extra) { h[k] = extra[k]; }
+    return h;
+  }
+  function setStats(el, text, cls) { el.textContent = text; el.className = 'stats' + (cls ? ' ' + cls : ''); }
+
+  $('key').value = lsGet(KEY_STORE);
+  $('key').addEventListener('input', function () { lsSet(KEY_STORE, key()); });
+
+  fetch('/health').then(function (r) { return r.json(); }).then(function (j) {
+    setStats($('health'), '· server ok (v' + j.version + ')', 'ok');
+  }).catch(function () {
+    setStats($('health'), '· server not reachable (it may be waking up, retry in a minute)', 'warn');
+  });
+
+  fetch('/v1/models').then(function (r) { return r.json(); }).then(function (j) {
+    var sel = $('model');
+    (j.data || []).forEach(function (m) {
+      var o = document.createElement('option');
+      o.value = m.id; o.textContent = m.id; sel.appendChild(o);
+    });
+    var pref = lsGet(MODEL_STORE) || 'glm-5.3';
+    sel.value = pref;
+    if (sel.value !== pref) { sel.selectedIndex = 0; }
+  });
+  $('model').addEventListener('change', function () { lsSet(MODEL_STORE, $('model').value); });
+
+  /* ---------- Chat test ---------- */
+  var controller = null;
+  function setBusy(b) { $('send').disabled = b; $('stop').disabled = !b; }
+  $('stop').addEventListener('click', function () { if (controller) { controller.abort(); } });
+
+  $('send').addEventListener('click', function () {
+    if (!key()) { setStats($('stats'), 'Enter your key first.', 'bad'); return; }
+
+    var body = {
+      model: $('model').value,
+      messages: [{ role: 'user', content: $('prompt').value }],
+      stream: true,
+      max_tokens: Number($('maxtok').value) || 1024
+    };
+    var eff = $('effort').value;
+    if (eff) { body.reasoning_effort = eff; }
+
+    var t0 = performance.now(), tFirst = null;
+    var content = '', reasoning = '', chunks = 0, used = '', finish = '', gotError = '';
+    var finished = false;
+
+    $('reply').textContent = '';
+    $('reasoning').textContent = '';
+    $('rdet').hidden = true;
+    controller = new AbortController();
+    setBusy(true);
+
+    var timer = setInterval(function () {
+      var label = tFirst === null ? (reasoning ? 'Model is reasoning… ' : 'Waiting for first text… ') : 'Streaming… ';
+      setStats($('stats'), label + fmt(performance.now() - t0));
+    }, 250);
+
+    function done(note) {
+      if (finished) { return; }
+      finished = true;
+      clearInterval(timer);
+      setBusy(false);
+      controller = null;
+      var s = 'Model: ' + (used || '?') +
+        ' · first text: ' + (tFirst === null ? 'none' : fmt(tFirst)) +
+        ' · total: ' + fmt(performance.now() - t0) +
+        ' · ' + chunks + ' chunks · ' + content.length + ' chars' +
+        (finish ? ' · finish: ' + finish : '');
+      var cls = 'ok';
+      if (!chunks && gotError && !note) { s = 'Request failed: ' + gotError; cls = 'bad'; }
+      else if (note) { s += ' · ' + note; cls = 'bad'; }
+      else if (gotError) { s += ' · error: ' + gotError; cls = 'bad'; }
+      else if (!content) { s += ' · No visible text arrived (the model may have used its whole token budget reasoning).'; cls = 'warn'; }
+      setStats($('stats'), s, cls);
+    }
+
+    function onLine(line) {
+      line = line.trim();
+      if (line.indexOf('data: ') !== 0) { return; }
+      var p = line.slice(6);
+      if (p === '[DONE]') { return; }
+      var j;
+      try { j = JSON.parse(p); } catch (e) { return; }
+      if (j.error) {
+        gotError = j.error.message || 'unknown error';
+        $('reply').textContent += '\n[error: ' + gotError + ']';
+        return;
+      }
+      if (j.model) { used = j.model; }
+      var c = j.choices && j.choices[0];
+      if (!c) { return; }
+      if (c.finish_reason) { finish = c.finish_reason; }
+      var d = c.delta || {};
+      chunks++;
+      var r = d.reasoning_content || d.reasoning;
+      if (r) {
+        reasoning += r;
+        $('reasoning').textContent = reasoning;
+        $('rdet').hidden = false;
+      }
+      if (d.content) {
+        if (tFirst === null) { tFirst = performance.now() - t0; }
+        content += d.content;
+        $('reply').textContent = content;
+      }
+    }
+
+    fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+      signal: controller.signal
+    }).then(function (res) {
+      if (!res.ok) {
+        return res.text().then(function (t) {
+          gotError = 'HTTP ' + res.status + ' ' + t.slice(0, 300);
+          done('');
+        });
+      }
+      var reader = res.body.getReader();
+      var dec = new TextDecoder();
+      var buf = '';
+      function pump() {
+        return reader.read().then(function (r) {
+          if (r.done) { if (buf) { onLine(buf); } done(''); return; }
+          buf += dec.decode(r.value, { stream: true });
+          var lines = buf.split('\n');
+          buf = lines.pop();
+          lines.forEach(onLine);
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (e) {
+      done(e && e.name === 'AbortError' ? 'stopped by you' : 'network error: ' + (e && e.message));
+    });
+  });
+
+  /* ---------- Model check ---------- */
+  function runCheck(model, timeoutSec) {
+    var url = '/test-model?model=' + encodeURIComponent(model) + '&timeout=' + timeoutSec;
+    return fetch(url, { headers: authHeaders() }).then(function (r) {
+      if (r.status === 403) { throw new Error('Wrong or missing key'); }
+      return r.json();
+    });
+  }
+
+  function describe(j) {
+    if (j.ok) {
+      var reply = j.reply ? String(j.reply).replace(/\s+/g, ' ').slice(0, 60) : '';
+      var t = 'OK in ' + j.seconds + 's' +
+        (j.reasoning_chars ? ' · ' + j.reasoning_chars + ' reasoning chars' : '') +
+        (reply ? ' · "' + reply + '"' : ' · empty reply');
+      return { cls: reply ? 'ok' : 'warn', text: t };
+    }
+    var e = j.error;
+    if (e && typeof e === 'object') { e = e.detail || e.message || JSON.stringify(e); }
+    return {
+      cls: 'bad',
+      text: 'Failed after ' + j.seconds + 's' + (j.http_status ? ' (HTTP ' + j.http_status + ')' : '') + ': ' + String(e).slice(0, 200)
+    };
+  }
+
+  $('checkOne').addEventListener('click', function () {
+    if (!key()) { setStats($('checkOut'), 'Enter your key first.', 'bad'); return; }
+    var m = $('checkModel').value.trim() || $('model').value;
+    var btn = $('checkOne');
+    btn.disabled = true;
+    setStats($('checkOut'), 'Testing ' + m + ' (up to 60s)…');
+    runCheck(m, 60).then(function (j) {
+      var d = describe(j);
+      setStats($('checkOut'), j.model + ' — ' + d.text, d.cls);
+    }).catch(function (e) {
+      setStats($('checkOut'), e.message, 'bad');
+    }).then(function () { btn.disabled = false; });
+  });
+
+  $('checkAll').addEventListener('click', function () {
+    if (!key()) { setStats($('checkOut'), 'Enter your key first.', 'bad'); return; }
+    var btn = $('checkAll');
+    var out = $('checkOut');
+    btn.disabled = true;
+    setStats(out, 'Loading model list…');
+
+    fetch('/v1/models?live=true').then(function (r) { return r.json(); }).then(function (j) {
+      if (!j.data) { throw new Error((j.error && j.error.message) || 'Could not load the model list'); }
+
+      var seen = {}, items = [];
+      j.data.forEach(function (m) {
+        if (seen[m.backend]) { seen[m.backend].aliases.push(m.id); }
+        else {
+          seen[m.backend] = { backend: m.backend, aliases: [m.id], available: m.available };
+          items.push(seen[m.backend]);
+        }
+      });
+
+      out.textContent = '';
+      out.className = '';
+      var table = document.createElement('table');
+      var head = document.createElement('tr');
+      ['Alias', 'NIM model', 'Result'].forEach(function (h) {
+        var th = document.createElement('th'); th.textContent = h; head.appendChild(th);
+      });
+      table.appendChild(head);
+      items.forEach(function (it) {
+        var tr = document.createElement('tr');
+        var a = document.createElement('td'); a.textContent = it.aliases.join(', ');
+        var b = document.createElement('td'); b.textContent = it.backend;
+        it.cell = document.createElement('td');
+        it.cell.textContent = 'queued';
+        tr.appendChild(a); tr.appendChild(b); tr.appendChild(it.cell);
+        table.appendChild(tr);
+      });
+      out.appendChild(table);
+
+      var idx = 0, active = 0;
+      function next() {
+        if (idx >= items.length) { if (active === 0) { btn.disabled = false; } return; }
+        var it = items[idx++];
+        if (!it.available) {
+          it.cell.textContent = 'Not in NIM catalog';
+          it.cell.className = 'bad';
+          return next();
+        }
+        active++;
+        it.cell.textContent = 'testing…';
+        runCheck(it.aliases[0], 30).then(function (r) {
+          var d = describe(r);
+          it.cell.textContent = d.text;
+          it.cell.className = d.cls;
+        }).catch(function (e) {
+          it.cell.textContent = e.message;
+          it.cell.className = 'bad';
+        }).then(function () { active--; next(); });
+      }
+      for (var i = 0; i < 3; i++) { next(); }
+    }).catch(function (e) {
+      setStats(out, e.message, 'bad');
+      btn.disabled = false;
+    });
+  });
+})();
+</script>
+</body>
+</html>`;
+
+app.get('/test', (req, res) => {
+  res.type('html').send(TEST_PAGE_HTML);
+});
+
 // Quick diagnostic: sends one tiny message to a model and reports timing + result.
 // Open in a browser: /test-model?key=YOUR_CLIENT_AUTH_KEY&model=gpt-4-flash
 // (model can be an alias like glm-5.3, or a full NIM id). Optional: &timeout=60
 app.get('/test-model', async (req, res) => {
-  const key = typeof req.query.key === 'string' ? req.query.key : '';
+  // Key can come from the Authorization header (used by the /test page) or ?key=.
+  const key = extractBearerToken(req.headers.authorization) ||
+    (typeof req.query.key === 'string' ? req.query.key : '');
   if (!CLIENT_AUTH_KEY || !safeTimingEqual(key, CLIENT_AUTH_KEY)) {
-    return res.status(403).json({ error: 'Add ?key=YOUR_CLIENT_AUTH_KEY to the URL' });
+    return res.status(403).json({ error: 'Missing or wrong key (send it as a Bearer token, or add ?key=YOUR_CLIENT_AUTH_KEY)' });
   }
 
   const requested = String(req.query.model || 'gpt-4-flash');
