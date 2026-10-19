@@ -111,7 +111,6 @@ const DEFAULT_MODEL = 'google/diffusiongemma-26b-a4b-it';
 // Ordered by observed reliability/speed — an early failing model delays every fallback behind it.
 const FALLBACK_MODELS = [
   'z-ai/glm-5.3',
-  'z-ai/glm-5-3-flash',
   'deepseek-ai/deepseek-v4.1-flash',
   'nvidia/nemotron-3-super-120b-a12b'
 ];
@@ -449,6 +448,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   let streamEndedCleanly = false;
   let upstreamStream = null;
   let heartbeat = null;
+  let streamStats = null;
 
   try {
     // For streaming requests, open the SSE response immediately and send
@@ -466,7 +466,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.on('close', () => {
         clearInterval(heartbeat);
         if (!streamEndedCleanly) {
-          console.warn('[STREAM] Client connection closed before stream finished');
+          const s = streamStats;
+          console.warn(
+            '[STREAM] Client connection closed before stream finished' +
+            (s ? ` (after ${Math.round((Date.now() - s.start) / 1000)}s of streaming: ${s.chunks} chunks, ${s.contentChars} content chars, ${s.reasoningChars} reasoning chars)` : ' (no upstream stream yet)')
+          );
         }
         if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
           upstreamStream.destroy();
@@ -518,11 +522,20 @@ app.post('/v1/chat/completions', async (req, res) => {
       let cleanedUp = false;
       const normalizer = new StreamNormalizer(usedModel);
       const toolRecovery = new ToolCallStreamRecovery();
-      const stats = { chunks: 0, contentChars: 0, reasoningChars: 0, finish: null, start: Date.now() };
+      const stats = streamStats = { chunks: 0, contentChars: 0, reasoningChars: 0, finish: null, start: Date.now(), raw: 0, ignored: 0 };
+
+      // Progress log every 10s so a stalled/slow upstream is visible in the logs.
+      const progress = setInterval(() => {
+        console.log(
+          `[STREAM] Progress (${usedModel}): ${Math.round((Date.now() - stats.start) / 1000)}s, ` +
+          `${stats.chunks} chunks, ${stats.contentChars} content chars, ${stats.reasoningChars} reasoning chars`
+        );
+      }, 10000);
 
       const cleanup = () => {
         if (cleanedUp) return;
         cleanedUp = true;
+        clearInterval(progress);
         if (heartbeat) clearInterval(heartbeat);
         if (upstreamStream) {
           upstreamStream.removeAllListeners();
@@ -531,7 +544,15 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
 
       const processLine = (line) => {
-        if (!line.startsWith('data: ')) return;
+        if (!line.startsWith('data: ')) {
+          if (DEBUG_MODE && line.trim() && stats.ignored++ < 5) {
+            console.log('[DEBUG] Ignored non-"data: " upstream line:', line.slice(0, 200));
+          }
+          return;
+        }
+        if (DEBUG_MODE && stats.raw++ < 3) {
+          console.log('[DEBUG] Upstream sample line:', line.slice(0, 300));
+        }
 
         // Exact match avoids false-positiving on model output that happens
         // to contain the literal substring "[DONE]".
@@ -548,6 +569,9 @@ app.post('/v1/chat/completions', async (req, res) => {
           const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
           stats.chunks++;
+          if (stats.chunks === 1) {
+            console.log(`[STREAM] First upstream chunk after ${Date.now() - stats.start}ms`);
+          }
           if (data.choices?.[0]?.finish_reason) stats.finish = data.choices[0].finish_reason;
 
           if (delta) {
