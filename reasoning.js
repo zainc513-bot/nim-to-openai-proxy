@@ -162,6 +162,7 @@ const REASONING_EFFORT_ENUMS = {
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
   'z-ai/glm-5.3': ['low', 'high', 'max'],
+  'z-ai/glm-5.3-flash': ['low', 'high', 'max'],
   'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
 };
 
@@ -246,17 +247,15 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     // producing any visible text, which makes clients like JanitorAI time out
     // ("network error"). So default to 'low'. The value is sent both top-level
     // and inside chat_template_kwargs since NIM's accepted location isn't documented.
-    case 'z-ai/glm-5.3': {
+    // GLM-5.3 Flash is assumed to share the same template (NIM's page lists
+    // no reasoning parameters for it); the setting is harmless if ignored.
+    case 'z-ai/glm-5.3':
+    case 'z-ai/glm-5.3-flash': {
       const level = effort || (enableThinking ? 'high' : 'low');
       return {
         reasoning_effort: level,
         chat_template_kwargs: { reasoning_effort: level }
       };
-    }
-
-    // Older GLM generations (GLM-5.2 and earlier) use enable_thinking.
-    case 'z-ai/glm-5-3-flash': {
-      return { chat_template_kwargs: { enable_thinking: !!enableThinking } };
     }
 
     case 'google/gemma-4-31b-it': {
