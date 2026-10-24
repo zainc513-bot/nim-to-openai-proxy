@@ -6,7 +6,7 @@ const cors = require('cors');
 const axios = require('axios');
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
-const { timingSafeEqual } = require('crypto');
+const { timingSafeEqual, createHash } = require('crypto');
 const { SHOW_REASONING, getReasoningPayload, resolveEffectiveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
 const { extractLeakedToolCalls, ToolCallStreamRecovery } = require('./tools');
 
@@ -24,6 +24,9 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 // Verbose logging: reasoning payload per fallback attempt, full request/error bodies on failure.
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
+// With DEBUG_MODE on, failed requests log a short summary (model, settings, message count).
+// Set DEBUG_FULL_BODY=true to log the whole prompt/chat instead (it ends up in Render's logs).
+const DEBUG_FULL_BODY = process.env.DEBUG_FULL_BODY === 'true';
 
 const MAX_TOKENS_LIMIT = 65536;
 
@@ -54,6 +57,12 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 60000;
 // whole reply. Streaming models start within ~20s even when thinking, so a long wait here
 // only delays the fallback past the client's own limit.
 const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 90000;
+// Non-streaming requests only get a response once the WHOLE reply has been generated, so the
+// "wait for the first byte" limits above would cut off any long reply. They get their own limit.
+const NONSTREAM_REQUEST_TIMEOUT_MS = Number(process.env.NONSTREAM_REQUEST_TIMEOUT_MS) || 300000;
+// Streaming: if NIM goes completely silent this long in the middle of a reply, end it
+// (with a visible note) instead of hanging until the client gives up.
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env.STREAM_IDLE_TIMEOUT_MS) || 120000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
@@ -117,6 +126,15 @@ const MODEL_MAPPING = {
 // Used when an unrecognized alias is requested. Must point at a live model.
 const DEFAULT_MODEL = 'google/diffusiongemma-26b-a4b-it';
 
+// Alias ("glm-5.3") -> NIM id, or a full NIM id passed straight through ("z-ai/glm-5.3").
+// Returns null for anything else, which the caller maps to DEFAULT_MODEL.
+function resolveModelId(name) {
+  if (typeof name !== 'string') return null;
+  if (MODEL_MAPPING[name]) return MODEL_MAPPING[name];
+  if (/^[\w.-]+\/[\w.:-]+$/.test(name)) return name;
+  return null;
+}
+
 // Ordered by observed reliability/speed — an early failing model delays every fallback behind it.
 const FALLBACK_MODELS = [
   'z-ai/glm-5.3',
@@ -128,21 +146,8 @@ const FALLBACK_MODELS = [
 // ─── Middleware ─────────────────────────────────────────────────────────
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-
-// Malformed JSON body -> clean OpenAI-style error instead of Express's default HTML error page.
-app.use((err, req, res, next) => {
-  if (err && err.type === 'entity.parse.failed') {
-    return res.status(400).json({
-      error: {
-        message: 'Invalid JSON in request body',
-        type: 'invalid_request_error',
-        code: 400
-      }
-    });
-  }
-  next(err);
-});
+// NOTE: the auth check below runs BEFORE the JSON body parser, so unauthenticated
+// requests can't make the server buffer and parse a huge body.
 
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
@@ -153,16 +158,18 @@ function extractBearerToken(authHeader) {
 }
 
 function safeTimingEqual(a, b) {
-  if (!a || !b || a.length !== b.length) return false;
-  try {
-    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-  } catch {
-    return false;
-  }
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+  // Compare fixed-length hashes so neither the content nor the LENGTH of the key leaks via timing.
+  const ha = createHash('sha256').update(a).digest();
+  const hb = createHash('sha256').update(b).digest();
+  return timingSafeEqual(ha, hb);
 }
 
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/v1/models' || req.path === '/' || req.path === '/test' || req.path === '/test-model') {
+  // Public: health check, landing page, the /test page shell, and the plain model list.
+  // /v1/models?live=true and /test-model call NIM with YOUR key, so they need auth like the rest.
+  const isPublicModelList = req.path === '/v1/models' && req.query.live !== 'true';
+  if (req.path === '/health' || req.path === '/' || req.path === '/test' || isPublicModelList) {
     return next();
   }
 
@@ -188,6 +195,22 @@ app.use((req, res, next) => {
   }
 
   next();
+});
+
+app.use(express.json({ limit: '50mb' }));
+
+// Malformed JSON body -> clean OpenAI-style error instead of Express's default HTML error page.
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      error: {
+        message: 'Invalid JSON in request body',
+        type: 'invalid_request_error',
+        code: 400
+      }
+    });
+  }
+  next(err);
 });
 
 // ─── Validation ─────────────────────────────────────────────────────────
@@ -222,6 +245,18 @@ async function validateModels() {
       } else {
         console.warn(`[VALIDATION] ✗ ${alias} → ${nimId} (not in catalog)`);
         invalid.push({ alias, nimId, error: 'Model not found in NIM catalog' });
+      }
+    }
+
+    // Also check the fallback chain and the default model: a dead ID there fails silently
+    // at request time (this is how a wrong GLM Flash ID sat in the chain unnoticed).
+    const chainChecks = [['(default model)', DEFAULT_MODEL], ...FALLBACK_MODELS.map(m => ['(fallback)', m])];
+    for (const [label, nimId] of chainChecks) {
+      if (availableModels.has(nimId)) {
+        console.log(`[VALIDATION] ✓ ${label} → ${nimId}`);
+      } else {
+        console.warn(`[VALIDATION] ✗ ${label} → ${nimId} (not in catalog)`);
+        invalid.push({ alias: label, nimId, error: 'Model not found in NIM catalog' });
       }
     }
 
@@ -276,6 +311,126 @@ function safeWrite(res, data) {
   return false;
 }
 
+// ─── Helper: in-band notices ─────────────────────────────────────────────
+
+// Once a stream has started the HTTP status is already 200, so errors can't use a status
+// code, and clients like JanitorAI don't surface error objects inside a stream. They DO show
+// text, so problems are delivered as a visible line at the end of the reply.
+function writeNoticeChunk(res, text) {
+  safeWrite(res, `data: ${JSON.stringify({
+    id: 'chatcmpl-proxy-notice',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: 'nim-proxy',
+    choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+  })}\n\n`);
+}
+
+function finishStreamWithNotice(res, text) {
+  if (text) writeNoticeChunk(res, text);
+  safeWrite(res, `data: ${JSON.stringify({
+    id: 'chatcmpl-proxy-notice',
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: 'nim-proxy',
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+  })}\n\n`);
+  safeWrite(res, 'data: [DONE]\n\n');
+  if (!res.writableEnded) res.end();
+}
+
+// ─── Helper: talking to NIM ──────────────────────────────────────────────
+
+// A failed STREAMING request comes back with the error body as a stream. Read it so the real
+// reason (e.g. an unsupported parameter) reaches the logs instead of just "status code 400".
+function readStreamBody(stream, limit = 4096, ms = 2000) {
+  return new Promise((resolve) => {
+    let buf = '';
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      try { stream.destroy(); } catch { /* ignore */ }
+      try { resolve(JSON.parse(buf)); } catch { resolve(buf.slice(0, limit)); }
+    };
+    const timer = setTimeout(finish, ms);
+    stream.on('data', (c) => { buf += c.toString('utf8'); if (buf.length > limit) finish(); });
+    stream.on('end', finish);
+    stream.on('error', finish);
+  });
+}
+
+function upstreamErrorText(err) {
+  const d = err.response?.data;
+  let text = '';
+  if (d && typeof d === 'object') {
+    text = (typeof d.error === 'string' ? d.error : d.error?.message) || d.detail || d.message || d.title || '';
+  } else if (typeof d === 'string') {
+    text = d;
+  }
+  return String(text || err.message || 'unknown error').slice(0, 300);
+}
+
+// Short description of a request for debug logs (the full body contains your whole prompt).
+function summarizeRequest(body) {
+  if (DEBUG_FULL_BODY) return JSON.stringify(body);
+  const { messages, ...rest } = body;
+  const list = Array.isArray(messages) ? messages : [];
+  const chars = list.reduce((n, m) => n + (typeof m?.content === 'string' ? m.content.length : JSON.stringify(m?.content ?? '').length), 0);
+  return JSON.stringify({ ...rest, messages: `[${list.length} messages, ~${chars} chars; set DEBUG_FULL_BODY=true to log them]` });
+}
+
+// POST to NIM with our own "first response" timer instead of axios' timeout, which is an IDLE
+// timer that would also kill a reply that merely pauses mid-stream. The timer stops as soon as
+// NIM starts answering. Also retries once if a reused keep-alive connection turns out to be dead.
+async function postToNim(fullRequest, firstByteMs, clientSignal, stream) {
+  for (let attempt = 1; ; attempt++) {
+    const ac = new AbortController();
+    let timedOut = false;
+    const onClientAbort = () => ac.abort();
+    if (clientSignal) {
+      if (clientSignal.aborted) ac.abort();
+      else clientSignal.addEventListener('abort', onClientAbort, { once: true });
+    }
+    const timer = setTimeout(() => { timedOut = true; ac.abort(); }, firstByteMs);
+
+    try {
+      return await nim.post('/chat/completions', fullRequest, {
+        headers: {
+          Authorization: `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: stream ? 'stream' : 'json',
+        timeout: 0,
+        signal: ac.signal
+      });
+    } catch (err) {
+      if (timedOut) {
+        const e = new Error(`timeout of ${firstByteMs}ms exceeded (NIM did not start answering)`);
+        e.timedOut = true;
+        e.code = 'ETIMEDOUT';
+        throw e;
+      }
+      if (clientSignal && clientSignal.aborted) throw err;
+
+      // Stale keep-alive socket: the request never reached NIM, so retrying once is safe.
+      if (attempt === 1 && !err.response && (err.code === 'ECONNRESET' || err.code === 'EPIPE')) {
+        console.warn(`[NIM] Connection was reset (${err.code}); retrying once on a fresh connection.`);
+        continue;
+      }
+
+      if (err.response?.data && typeof err.response.data.on === 'function') {
+        err.response.data = await readStreamBody(err.response.data);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      if (clientSignal) clientSignal.removeEventListener('abort', onClientAbort);
+    }
+  }
+}
+
 // ─── Helper: Fallback Chain ──────────────────────────────────────────────
 
 // Per-model cooldown after a 403/429, in-memory (resets on restart, not shared across instances).
@@ -283,6 +438,9 @@ const modelCooldowns = new Map(); // model -> timestamp (ms) until which to skip
 
 const RATE_LIMIT_COOLDOWN_MS = Number(process.env.RATE_LIMIT_COOLDOWN_MS) || 30000;
 const ACCESS_DENIED_COOLDOWN_MS = Number(process.env.ACCESS_DENIED_COOLDOWN_MS) || 300000;
+// After a 502/503/504 or a timeout (model not answering), skip it briefly so each message
+// doesn't pay the full wait again. /test-model ignores this, so you can still probe it.
+const UPSTREAM_DOWN_COOLDOWN_MS = Number(process.env.UPSTREAM_DOWN_COOLDOWN_MS) || 90000;
 
 function isInCooldown(model) {
   const until = modelCooldowns.get(model);
@@ -295,9 +453,13 @@ function setCooldown(model, ms) {
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools, signal) {
   let lastError = null;
-  const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
-    ? REASONING_REQUEST_TIMEOUT_MS
-    : REQUEST_TIMEOUT_MS;
+  // How long to wait for NIM to START answering. A non-streaming request gets nothing back
+  // until the whole reply exists, so it needs a far longer limit than a streaming one.
+  const timeoutMs = !baseRequest.stream
+    ? NONSTREAM_REQUEST_TIMEOUT_MS
+    : (resolveEffectiveThinking(enableThinking, clientReasoningEffort)
+      ? REASONING_REQUEST_TIMEOUT_MS
+      : REQUEST_TIMEOUT_MS);
 
   // Skip cooling-down models; fall back to the full list if that empties the chain.
   const activeModels = models.filter(m => !isInCooldown(m));
@@ -317,19 +479,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
     }
 
     try {
-      const res = await nim.post(
-        '/chat/completions',
-        fullRequest,
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: timeoutMs,
-          signal
-        }
-      );
+      const res = await postToNim(fullRequest, timeoutMs, signal, !!baseRequest.stream);
       return { response: res, model };
     } catch (err) {
       lastError = err;
@@ -344,10 +494,10 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       console.warn(
         `[FALLBACK] Model failed: ${model}`,
         status,
-        err.response?.data?.error?.message || err.message
+        upstreamErrorText(err)
       );
       if (DEBUG_MODE) {
-        console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
+        console.log(`[DEBUG] Request sent to ${model}:`, summarizeRequest(fullRequest));
         console.log(`[DEBUG] Full upstream error response:`, JSON.stringify(err.response?.data || null));
       }
 
@@ -364,6 +514,13 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       // 429: rate limited — short cooldown.
       if (status === 429) {
         setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
+      }
+
+      // Model not answering (gateway error or our own timeout): short cooldown.
+      const timedOut = !!err.timedOut;
+      if (status === 502 || status === 503 || status === 504 || timedOut) {
+        setCooldown(model, UPSTREAM_DOWN_COOLDOWN_MS);
+        console.warn(`[FALLBACK] ${model} not answering; skipping it for ${Math.round(UPSTREAM_DOWN_COOLDOWN_MS / 1000)}s`);
       }
     }
   }
@@ -473,6 +630,25 @@ app.post('/v1/chat/completions', async (req, res) => {
   let streamStats = null;
   const abortController = new AbortController();
 
+  // Fires when the response is over for ANY reason. If we hadn't finished writing it, the client
+  // left (or gave up): stop the upstream work too. This replaces the old req.on('close') handler,
+  // which never fires on Node 16+ once the request body has been read (checked on Node 22).
+  res.on('close', () => {
+    if (heartbeat) clearInterval(heartbeat);
+    if (res.writableFinished) return;
+    abortController.abort();
+    const s = streamStats;
+    console.warn(
+      '[CLIENT] Disconnected before the reply finished' +
+      (s
+        ? ` (after ${Math.round((Date.now() - s.start) / 1000)}s of streaming: ${s.chunks} chunks, ${s.contentChars} content chars, ${s.reasoningChars} reasoning chars)`
+        : ' (still waiting on NIM)')
+    );
+    if (upstreamStream && !upstreamStream.destroyed) {
+      upstreamStream.destroy();
+    }
+  });
+
   try {
     // For streaming requests, open the SSE response immediately and send
     // periodic comment lines while waiting on upstream. Without this, slow
@@ -486,25 +662,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.flushHeaders();
       safeWrite(res, ': connected\n\n');
       heartbeat = setInterval(() => safeWrite(res, ': keep-alive\n\n'), HEARTBEAT_INTERVAL_MS);
-      res.on('close', () => {
-        clearInterval(heartbeat);
-        if (!streamEndedCleanly) abortController.abort();
-        if (!streamEndedCleanly) {
-          const s = streamStats;
-          console.warn(
-            '[STREAM] Client connection closed before stream finished' +
-            (s ? ` (after ${Math.round((Date.now() - s.start) / 1000)}s of streaming: ${s.chunks} chunks, ${s.contentChars} content chars, ${s.reasoningChars} reasoning chars)` : ' (no upstream stream yet)')
-          );
-        }
-        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
-          upstreamStream.destroy();
-        }
-      });
     }
 
     const { model, max_tokens, temperature, stream, reasoning_effort } = req.body;
 
-    let primaryModel = MODEL_MAPPING[model];
+    let primaryModel = resolveModelId(model);
     if (!primaryModel) {
       console.warn(`[PROXY] Unknown model alias "${model}", falling back to default: ${DEFAULT_MODEL}`);
       primaryModel = DEFAULT_MODEL;
@@ -548,13 +710,23 @@ app.post('/v1/chat/completions', async (req, res) => {
       const normalizer = new StreamNormalizer(usedModel);
       const toolRecovery = new ToolCallStreamRecovery();
       const stats = streamStats = { chunks: 0, contentChars: 0, reasoningChars: 0, finish: null, start: Date.now(), raw: 0, ignored: 0 };
+      let sawToolCall = false;
+      let lastChunkAt = Date.now();
 
-      // Progress log every 10s so a stalled/slow upstream is visible in the logs.
+      // Every 10s: log progress (so a slow upstream is visible) and check the stall watchdog.
       const progress = setInterval(() => {
         console.log(
           `[STREAM] Progress (${usedModel}): ${Math.round((Date.now() - stats.start) / 1000)}s, ` +
           `${stats.chunks} chunks, ${stats.contentChars} content chars, ${stats.reasoningChars} reasoning chars`
         );
+        if (Date.now() - lastChunkAt > STREAM_IDLE_TIMEOUT_MS) {
+          console.error(`[STREAM] ${usedModel} sent nothing for ${Math.round((Date.now() - lastChunkAt) / 1000)}s mid-reply; ending the reply.`);
+          const silent = upstreamStream;
+          streamEndedCleanly = true;
+          cleanup();
+          if (silent && !silent.destroyed) silent.destroy();
+          finishStreamWithNotice(res, '\n\n[Proxy notice: the model stopped responding partway through, so this reply was cut short.]');
+        }
       }, 10000);
 
       const cleanup = () => {
@@ -565,7 +737,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (upstreamStream) {
           upstreamStream.removeAllListeners();
         }
-        req.removeAllListeners('close');
       };
 
       const processLine = (line) => {
@@ -582,10 +753,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         // Exact match avoids false-positiving on model output that happens
         // to contain the literal substring "[DONE]".
         if (line.trim() === 'data: [DONE]') {
-          if (!doneSent) {
-            safeWrite(res, 'data: [DONE]\n\n');
-            doneSent = true;
-          }
+          // Not forwarded yet: the 'end' handler flushes any leftover text and notices first,
+          // then sends [DONE] exactly once (previously leftovers were written AFTER [DONE]).
+          doneSent = true;
           streamEndedCleanly = true;
           return;
         }
@@ -594,6 +764,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
           stats.chunks++;
+          if (delta && delta.tool_calls) sawToolCall = true;
           if (stats.chunks === 1) {
             console.log(`[STREAM] First upstream chunk after ${Date.now() - stats.start}ms`);
           }
@@ -626,6 +797,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             const { content: recoveredContent, toolCallDeltas } = toolRecovery.process(clientContent);
             clientContent = recoveredContent;
             if (toolCallDeltas.length > 0) {
+              sawToolCall = true;
               delta.tool_calls = toolCallDeltas;
               if (data.choices[0]) data.choices[0].finish_reason = 'tool_calls';
             }
@@ -655,18 +827,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
 
       upstreamStream.on('data', chunk => {
+        lastChunkAt = Date.now();
         buffer += decoder.write(chunk);
 
         if (buffer.length > MAX_BUFFER_SIZE) {
           console.error('[STREAM] Buffer overflow, destroying connection');
-          safeWrite(res, `data: ${JSON.stringify({
-            error: {
-              message: 'Stream buffer overflow',
-              type: 'stream_error'
-            }
-          })}\n\n`);
-          safeWrite(res, 'data: [DONE]\n\n');
-          res.end();
+          streamEndedCleanly = true;
+          finishStreamWithNotice(res, '\n\n[Proxy error: the model sent a malformed stream, so this reply was cut short.]');
           upstreamStream.destroy();
           cleanup();
           return;
@@ -735,17 +902,18 @@ app.post('/v1/chat/completions', async (req, res) => {
           reasoningOpen = false;
         }
 
-        if (!doneSent) {
-          safeWrite(res, 'data: [DONE]\n\n');
+        // A reply with no visible text shows up as a blank/errored message in the client.
+        // Say why, in the chat itself, instead of leaving it blank.
+        if (stats.contentChars === 0 && !sawToolCall) {
+          console.warn('[STREAM] Upstream produced NO visible content (reasoning may have used the whole token budget).');
+          writeNoticeChunk(res, `[Proxy notice: ${usedModel} finished without any visible text. It may have spent its whole token budget on reasoning. Try again, lower the reasoning level, or raise max tokens.]`);
         }
+        safeWrite(res, 'data: [DONE]\n\n');
         console.log(
           `[STREAM] Finished (${usedModel}): ${stats.chunks} chunks, ` +
           `${stats.contentChars} content chars, ${stats.reasoningChars} reasoning chars, ` +
           `finish_reason=${stats.finish}, ${Date.now() - stats.start}ms`
         );
-        if (stats.contentChars === 0) {
-          console.warn('[STREAM] Upstream produced NO visible content (reasoning may have used the whole token budget).');
-        }
         streamEndedCleanly = true;
         if (!res.writableEnded) {
           res.end();
@@ -755,26 +923,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       upstreamStream.on('error', err => {
         console.error('[STREAM] Upstream error:', err.message);
+        streamEndedCleanly = true;
         if (!res.writableEnded) {
-          safeWrite(res, `data: ${JSON.stringify({
-            error: {
-              message: 'Stream interrupted by upstream error',
-              type: 'stream_error'
-            }
-          })}\n\n`);
-          safeWrite(res, 'data: [DONE]\n\n');
-          res.end();
-        }
-        cleanup();
-      });
-
-      req.on('close', () => {
-        const clientGone = req.destroyed || !res.writable;
-        if (!streamEndedCleanly && clientGone) {
-          console.warn('[STREAM] Client disconnected prematurely');
-        }
-        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
-          upstreamStream.destroy();
+          finishStreamWithNotice(res, `\n\n[Proxy error: the connection to the model dropped mid-reply (${err.message}), so this reply was cut short.]`);
         }
         cleanup();
       });
@@ -842,29 +993,26 @@ app.post('/v1/chat/completions', async (req, res) => {
       return;
     }
 
+    const reason = upstreamErrorText(error);
     console.error('[PROXY] Fatal error:', error.message);
-    console.error('[PROXY] NIM response:', error.response?.data);
+    console.error('[PROXY] NIM response:', error.response?.data ?? '(none)');
 
     if (!res.headersSent) {
       // Express only sets Content-Type if unset; force JSON in case the
       // streaming branch already set text/event-stream before failing.
+      const status = error.response?.status || (error.timedOut ? 504 : 500);
       res.set('Content-Type', 'application/json');
-      res.status(error.response?.status || 500).json({
+      res.status(status).json({
         error: {
-          message: error.message,
+          message: reason,
           type: 'invalid_request_error',
-          code: error.response?.status || 500
+          code: status
         }
       });
     } else if (!res.writableEnded) {
-      safeWrite(res, `data: ${JSON.stringify({
-        error: {
-          message: error.message,
-          type: 'proxy_error'
-        }
-      })}\n\n`);
-      safeWrite(res, 'data: [DONE]\n\n');
-      res.end();
+      // The stream already started (HTTP 200 is sent), so the error goes out as visible text.
+      const status = error.response?.status;
+      finishStreamWithNotice(res, `[Proxy error: every model failed${status ? ` (last error: HTTP ${status})` : ''}. ${reason}]`);
     }
 
     if (upstreamStream && !upstreamStream.destroyed) {
@@ -1155,7 +1303,10 @@ const TEST_PAGE_HTML = String.raw`<!DOCTYPE html>
     btn.disabled = true;
     setStats(out, 'Loading model list…');
 
-    fetch('/v1/models?live=true').then(function (r) { return r.json(); }).then(function (j) {
+    fetch('/v1/models?live=true', { headers: authHeaders() }).then(function (r) {
+      if (r.status === 403) { throw new Error('Wrong key (HTTP 403)'); }
+      return r.json();
+    }).then(function (j) {
       if (!j.data) { throw new Error((j.error && j.error.message) || 'Could not load the model list'); }
 
       var seen = {}, items = [];
@@ -1222,16 +1373,11 @@ app.get('/test', (req, res) => {
 });
 
 // Quick diagnostic: sends one tiny message to a model and reports timing + result.
-// Open in a browser: /test-model?key=YOUR_CLIENT_AUTH_KEY&model=gpt-4-flash
-// (model can be an alias like glm-5.3, or a full NIM id). Optional: &timeout=60
+// Used by the Model check section of the /test page. The Bearer key is checked by the
+// auth middleware above (a ?key= URL parameter is intentionally NOT accepted any more:
+// keys in URLs end up in browser history and server logs).
+// model can be an alias like glm-5.3, or a full NIM id. Optional: &timeout=60
 app.get('/test-model', async (req, res) => {
-  // Key can come from the Authorization header (used by the /test page) or ?key=.
-  const key = extractBearerToken(req.headers.authorization) ||
-    (typeof req.query.key === 'string' ? req.query.key : '');
-  if (!CLIENT_AUTH_KEY || !safeTimingEqual(key, CLIENT_AUTH_KEY)) {
-    return res.status(403).json({ error: 'Missing or wrong key (send it as a Bearer token, or add ?key=YOUR_CLIENT_AUTH_KEY)' });
-  }
-
   const requested = String(req.query.model || 'gpt-4-flash');
   const modelId = MODEL_MAPPING[requested] || requested;
   const timeoutMs = Math.min(Number(req.query.timeout) || 60, 120) * 1000;
@@ -1282,6 +1428,15 @@ app.use((req, res) => {
 });
 
 // ─── Startup ──────────────────────────────────────────────────────────────
+
+// Log (rather than silently die on) stray async errors. An unhandled rejection from a
+// dropped upstream socket should never take the whole proxy down mid-chat.
+process.on('unhandledRejection', (reason) => {
+  console.error('[PROCESS] Unhandled rejection:', reason && reason.message ? reason.message : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[PROCESS] Uncaught exception:', err && err.stack ? err.stack : err);
+});
 
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
