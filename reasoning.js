@@ -225,8 +225,14 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     case 'deepseek-ai/deepseek-v4.1-flash':
     case 'deepseek-ai/deepseek-v4-flash-0731':
     case 'deepseek-ai/deepseek-v4-pro-0813': {
-      if (!enableThinking) {
-        return { chat_template_kwargs: { thinking: false } };
+      // DeepSeek V4 runs in non-thinking mode by default; the documented way to keep
+      // it off is to send NO reasoning keys at all (an explicit thinking:false isn't
+      // documented, so it's not sent).
+      // It also IGNORES the global ENABLE_THINKING_MODE: thinking only turns on when the
+      // client asks for it explicitly (reasoning_effort "on", "low", "high" or "max").
+      const clientAskedForThinking = clientReasoningEffort === 'on' || !!effort;
+      if (!clientAskedForThinking) {
+        return {};
       }
       return {
         chat_template_kwargs: {

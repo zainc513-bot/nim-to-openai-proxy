@@ -50,7 +50,10 @@ const nim = axios.create({
 // under the client's own limit (JanitorAI gives up around 2 minutes), otherwise a hung
 // model eats the whole window and the fallback never gets a chance to reply in time.
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 60000;
-const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
+// Same idea when thinking is on: this is the wait for NIM to start answering, not for the
+// whole reply. Streaming models start within ~20s even when thinking, so a long wait here
+// only delays the fallback past the client's own limit.
+const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 90000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
