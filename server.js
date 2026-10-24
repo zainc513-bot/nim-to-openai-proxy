@@ -86,6 +86,7 @@ const MODEL_MAPPING = {
   // DeepSeek v4.1 Flash was timing out on NIM even for a tiny request (checked via /test-model).
   // To restore it, swap this back to 'deepseek-ai/deepseek-v4.1-flash'.
   'gpt-4-flash': 'z-ai/glm-5.3-flash',
+  'deepseek': 'deepseek-ai/deepseek-v4.1-flash',
   'gpt-4o': 'stepfun-ai/step-5-preview',
   'mistral': 'mistralai/mistral-large-2-instruct', 
   'mistral-turbo': 'nv-mistralai/mistral-nemo-12b-instruct',
