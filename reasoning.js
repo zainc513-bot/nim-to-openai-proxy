@@ -1,8 +1,5 @@
 // reasoning.js
-// Backend-specific "thinking" control.
-
 const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
-if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 
 const CONTENT_DELIMITER_TAGS = {
   'minimaxai/minimax-m3': ['<mm:think>', '</mm:think>']
@@ -47,7 +44,6 @@ class DelimiterParser {
         break;
       }
     }
-
     return { content, reasoning };
   }
 
@@ -184,7 +180,6 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     case 'deepseek-ai/deepseek-v4.1-flash':
     case 'deepseek-ai/deepseek-v4-flash-0731':
     case 'deepseek-ai/deepseek-v4-pro-0813': {
-      // Fix: Use rawEffort so 'medium' doesn't silently disable thinking.
       const wantsThinking = clientReasoningEffort === 'on' || !!rawEffort;
       if (!wantsThinking) {
         return { chat_template_kwargs: { thinking: false } };
@@ -203,7 +198,6 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
 
     case 'z-ai/glm-5.3':
     case 'z-ai/glm-5.3-flash': {
-      // Fix: Default to 'low' to prevent 80s timeouts on glm-flash.
       const level = effort || 'low';
       return {
         reasoning_effort: level,
