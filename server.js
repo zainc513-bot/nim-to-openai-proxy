@@ -27,9 +27,10 @@ const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS) || 10000
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
 const nim = axios.create({ baseURL: NIM_API_BASE, httpsAgent: keepAliveAgent });
 
-const REQUEST_TIMEOUT_MS = 60000;
-const STREAM_IDLE_TIMEOUT_MS = 60000;
-const THINKING_DEADLINE_MS = 60000;
+// INCREASED TO 2 MINUTES (120000ms) FOR LARGE ROLEPLAY PROMPTS
+const REQUEST_TIMEOUT_MS = 120000;
+const STREAM_IDLE_TIMEOUT_MS = 120000;
+const THINKING_DEADLINE_MS = 120000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024;
 
@@ -37,16 +38,15 @@ if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 if (DEBUG_MODE) console.log('[CONFIG] Debug mode: ENABLED');
 
 function validateConfig() {
-  // Removed process.exit so it prints the error without crashing Render silently.
   if (!NIM_API_KEY) console.error('❌ [FATAL ERROR] NIM_API_KEY is missing from Render environment variables!');
   if (!CLIENT_AUTH_KEY) console.warn('⚠️ [WARN] CLIENT_AUTH_KEY is missing from Render environment variables.');
 }
 validateConfig();
 
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'mistralai/mistral-large-2-instruct',
-  'gpt-4': 'mistralai/mistral-large-2-instruct',
-  'gpt-3.5': 'mistralai/mistral-7b-instruct-v0.3',
+  'gpt-3.5-turbo': 'nvidia/llama3-chatqa-1.5-70b',
+  'gpt-4': 'minimaxai/minimax-m3.1-flash',
+  'gpt-3.5': 'nvidia/llama3-chatqa-1.5-70b',
   'gpt-4-turbo': 'nvidia/nemotron-3.5-super-vl-120b-a12b',
   'claude-3-opus': 'google/diffusiongemma-26b-a4b-it',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
@@ -56,9 +56,9 @@ const MODEL_MAPPING = {
   'gpt-4-flash': 'z-ai/glm-5.3-flash',
   'deepseek': 'deepseek-ai/deepseek-v4.1-flash',
   'gpt-4o': 'stepfun-ai/step-5-preview',
-  'mistral': 'mistralai/mistral-large-2-instruct', 
+  'mistral': 'nvidia/llama3-chatqa-1.5-70b', 
   'mistral-turbo': 'nv-mistralai/mistral-nemo-12b-instruct',
-  'mistral-pro': 'mistralai/mistral-7b-instruct-v0.3', 
+  'mistral-pro': 'nvidia/llama3-chatqa-1.5-70b', 
   'mistral-fast': 'nvidia/mistral-nemo-minitron-8b-8k-instruct', 
   'google-light': 'google/gemma-4-31b-it',
   'google-lightest': 'meta/muse-glimmer-30b',
@@ -71,7 +71,13 @@ const MODEL_MAPPING = {
   'llama-3.2-vision': 'meta/llama-3.2-11b-vision-instruct'
 };
 
-const DEFAULT_MODEL = 'mistralai/mistral-large-2-instruct';
+const DEFAULT_MODEL = 'minimaxai/minimax-m3.1-flash';
+
+const FALLBACK_MODELS = [
+  'minimaxai/minimax-m3.1-flash',
+  'nvidia/llama3-chatqa-1.5-70b',
+  'openai/gpt-oss-20b'
+];
 
 function resolveModelId(name) {
   if (typeof name !== 'string') return null;
@@ -79,12 +85,6 @@ function resolveModelId(name) {
   if (/^[\w.-]+\/[\w.:-]+$/.test(name)) return name;
   return null;
 }
-
-const FALLBACK_MODELS = [
-  'mistralai/mistral-large-2-instruct',
-  'google/gemma-4-31b-it',
-  'mistralai/mistral-7b-instruct-v0.3'
-];
 
 app.use(cors());
 
