@@ -1,6 +1,4 @@
 // tools.js
-// Tool-call leak recovery.
-
 const TOOL_CALL_OPEN = '<tool_call>';
 const TOOL_CALL_CLOSE = '</tool_call>';
 
