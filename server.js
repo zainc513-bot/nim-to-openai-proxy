@@ -27,10 +27,10 @@ const HEARTBEAT_INTERVAL_MS = 10000;
 
 // Speed controls. The important one is FIRST_TOKEN_TIMEOUT_MS: if a model has not produced
 // anything by then, we give up on it and move to the next model in the chain.
-const FIRST_TOKEN_TIMEOUT_MS = num(process.env.FIRST_TOKEN_TIMEOUT_MS, 30000); // streaming: wait for first chunk
-const STREAM_IDLE_TIMEOUT_MS = num(process.env.STREAM_IDLE_TIMEOUT_MS, 60000); // streaming: max silence mid-reply
-const NON_STREAM_TIMEOUT_MS = num(process.env.REQUEST_TIMEOUT_MS, 90000);      // non-streaming: whole reply
-const TOTAL_BUDGET_MS = num(process.env.TOTAL_BUDGET_MS, 120000);              // all fallbacks combined
+const FIRST_TOKEN_TIMEOUT_MS = num(process.env.FIRST_TOKEN_TIMEOUT_MS, 120000); // streaming: wait for first chunk (RP/big models queue a long time)
+const STREAM_IDLE_TIMEOUT_MS = num(process.env.STREAM_IDLE_TIMEOUT_MS, 120000); // streaming: max silence mid-reply
+const NON_STREAM_TIMEOUT_MS = num(process.env.REQUEST_TIMEOUT_MS, 180000);     // non-streaming: whole reply
+const TOTAL_BUDGET_MS = num(process.env.TOTAL_BUDGET_MS, 300000);              // all fallbacks combined
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10000 });
 const nim = axios.create({ baseURL: NIM_API_BASE, httpsAgent: keepAliveAgent });
@@ -49,7 +49,6 @@ const MODEL_MAPPING = {
   'glm-5.3': 'z-ai/glm-5.3',
   'deepseek': 'deepseek-ai/deepseek-v4.1-flash',
   'deepseek-flash': 'deepseek-ai/deepseek-v4-flash-0731',
-  'llama-3.1-8b': 'meta/llama-3.1-8b-instruct',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'm3': 'minimaxai/minimax-m3'
 };
@@ -59,10 +58,11 @@ try {
   if (process.env.MODEL_MAP_JSON) Object.assign(MODEL_MAPPING, JSON.parse(process.env.MODEL_MAP_JSON));
 } catch (e) { console.warn(`[CONFIG] MODEL_MAP_JSON ignored: ${e.message}`); }
 
-const DEFAULT_MODEL = 'meta/llama-3.1-8b-instruct';
+// meta/llama-3.1-8b-instruct reached end of life on NIM (HTTP 410), so it is no longer used.
+const DEFAULT_MODEL = 'google/gemma-4-31b-it';
 const FALLBACK_MODELS = process.env.FALLBACK_MODELS
   ? process.env.FALLBACK_MODELS.split(',').map(s => s.trim()).filter(Boolean)
-  : ['meta/llama-3.1-8b-instruct', 'z-ai/glm-5.3-flash'];
+  : ['google/gemma-4-31b-it', 'z-ai/glm-5.3-flash'];
 
 function resolveModelId(name) {
   if (typeof name !== 'string') return null;
@@ -270,7 +270,7 @@ async function callWithFallback({ baseReq, models, effort, isStream, signal }) {
         if (status === 401) throw err; // bad NIM key: no point trying other models
         if ((status === 400 || status === 422) && v < variants.length - 1) continue;
         if (status === 429) cooldowns.set(model, Date.now() + 30000);
-        else if (status === 404) cooldowns.set(model, Date.now() + 5 * 60000);
+        else if (status === 404 || status === 410) cooldowns.set(model, Date.now() + 60 * 60000); // gone / end of life
         else if (status === 503 || status === 504 || err.timedOut) cooldowns.set(model, Date.now() + 60000);
         break;
       }
