@@ -37,7 +37,9 @@ function normalizeEffort(model, raw) {
  * When it is OFF we actively tell the model so, because several NIM models think by default,
  * and that is the #1 reason replies feel slow.
  */
-function getReasoningPayload(model, enableThinking, clientReasoningEffort) {
+// Decides whether thinking is on, the effort, and whether this is a "heavy" request
+// (real thinking at medium/high/max effort), which is what deserves a long wait.
+function resolveThinking(model, enableThinking, clientReasoningEffort) {
   const raw = typeof clientReasoningEffort === 'string' ? clientReasoningEffort.toLowerCase().trim() : undefined;
   const effort = normalizeEffort(model, raw);
 
@@ -45,6 +47,15 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort) {
   if (raw === 'off' || raw === 'none') thinking = false;
   else if (raw === 'on' || effort) thinking = true;
   else thinking = !!enableThinking;
+
+  // GLM is forced to "low" when no effort is given; everything else defaults to high.
+  const effective = effort || (model.startsWith('z-ai/glm') ? 'low' : 'high');
+  const heavy = thinking && !['low', 'minimal'].includes(effective);
+  return { thinking, effort, heavy };
+}
+
+function getReasoningPayload(model, enableThinking, clientReasoningEffort) {
+  const { thinking, effort } = resolveThinking(model, enableThinking, clientReasoningEffort);
 
   switch (model) {
     // ─── DeepSeek ───
@@ -175,4 +186,4 @@ function normalizeNonStreamChoice(choice, model) {
   return { ...choice, message: newMsg };
 }
 
-module.exports = { SHOW_REASONING, getReasoningPayload, StreamNormalizer, normalizeNonStreamChoice };
+module.exports = { SHOW_REASONING, getReasoningPayload, resolveThinking, StreamNormalizer, normalizeNonStreamChoice };

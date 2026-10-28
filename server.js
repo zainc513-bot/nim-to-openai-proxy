@@ -6,7 +6,7 @@ const axios = require('axios');
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
 const { timingSafeEqual, createHash } = require('crypto');
-const { SHOW_REASONING, getReasoningPayload, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
+const { SHOW_REASONING, getReasoningPayload, resolveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
 const { extractLeakedToolCalls, ToolCallStreamRecovery } = require('./tools');
 
 const app = express();
@@ -27,9 +27,12 @@ const HEARTBEAT_INTERVAL_MS = 10000;
 
 // Speed controls. The important one is FIRST_TOKEN_TIMEOUT_MS: if a model has not produced
 // anything by then, we give up on it and move to the next model in the chain.
-const FIRST_TOKEN_TIMEOUT_MS = num(process.env.FIRST_TOKEN_TIMEOUT_MS, 120000); // streaming: wait for first chunk (RP/big models queue a long time)
+// Two tiers: "heavy" = thinking at medium/high/max effort (long wait is fine), "fast" = thinking off or low effort.
+const FIRST_TOKEN_TIMEOUT_MS = num(process.env.FIRST_TOKEN_TIMEOUT_THINKING_MS, 120000); // streaming, heavy thinking
+const FIRST_TOKEN_TIMEOUT_FAST_MS = num(process.env.FIRST_TOKEN_TIMEOUT_MS, 45000);      // streaming, thinking off/low
 const STREAM_IDLE_TIMEOUT_MS = num(process.env.STREAM_IDLE_TIMEOUT_MS, 120000); // streaming: max silence mid-reply
-const NON_STREAM_TIMEOUT_MS = num(process.env.REQUEST_TIMEOUT_MS, 180000);     // non-streaming: whole reply
+const NON_STREAM_TIMEOUT_MS = num(process.env.REQUEST_TIMEOUT_THINKING_MS, 180000); // non-streaming, heavy thinking
+const NON_STREAM_TIMEOUT_FAST_MS = num(process.env.REQUEST_TIMEOUT_MS, 90000);      // non-streaming, thinking off/low
 const TOTAL_BUDGET_MS = num(process.env.TOTAL_BUDGET_MS, 300000);              // all fallbacks combined
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10000 });
@@ -248,7 +251,10 @@ async function callWithFallback({ baseReq, models, effort, isStream, signal }) {
     if (signal?.aborted) throw lastErr || new Error('Client aborted');
     const remaining = TOTAL_BUDGET_MS - (Date.now() - started);
     if (lastErr && remaining < 3000) break;
-    const perAttempt = isStream ? FIRST_TOKEN_TIMEOUT_MS : NON_STREAM_TIMEOUT_MS;
+    const { heavy } = resolveThinking(model, ENABLE_THINKING_MODE, effort);
+    const perAttempt = isStream
+      ? (heavy ? FIRST_TOKEN_TIMEOUT_MS : FIRST_TOKEN_TIMEOUT_FAST_MS)
+      : (heavy ? NON_STREAM_TIMEOUT_MS : NON_STREAM_TIMEOUT_FAST_MS);
     const timeoutMs = Math.max(3000, Math.min(perAttempt, remaining));
 
     // First try with reasoning params; if NIM rejects them (400/422), retry the same model without.
