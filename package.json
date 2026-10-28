@@ -1,6 +1,6 @@
 {
   "name": "nim-openai-proxy",
-  "version": "6.0.0",
+  "version": "6.1.0",
   "description": "Clean OpenAI-compatible proxy for NVIDIA NIM",
   "main": "server.js",
   "scripts": {
