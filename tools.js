@@ -1,126 +1,89 @@
-// tools.js
-const TOOL_CALL_OPEN = '<tool_call>';
-const TOOL_CALL_CLOSE = '</tool_call>';
+// tools.js — Recovery for leaked <tool_call> tags in content
 
-function generateToolCallId() {
+const OPEN = '<tool_call>';
+const CLOSE = '</tool_call>';
+
+function genId() {
   return `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function extractLeakedToolCalls(content) {
-  if (!content || !content.includes(TOOL_CALL_OPEN)) {
-    return { content, toolCalls: [] };
-  }
-
+  if (!content || !content.includes(OPEN)) return { content, toolCalls: [] };
   const toolCalls = [];
-  let result = '';
-  let cursor = 0;
+  let result = '', cursor = 0;
 
   while (true) {
-    const openIdx = content.indexOf(TOOL_CALL_OPEN, cursor);
-    if (openIdx === -1) {
-      result += content.slice(cursor);
-      break;
-    }
-    const closeIdx = content.indexOf(TOOL_CALL_CLOSE, openIdx);
-    if (closeIdx === -1) {
-      result += content.slice(cursor);
-      break;
-    }
+    const openIdx = content.indexOf(OPEN, cursor);
+    if (openIdx === -1) { result += content.slice(cursor); break; }
+    const closeIdx = content.indexOf(CLOSE, openIdx);
+    if (closeIdx === -1) { result += content.slice(cursor); break; }
 
     result += content.slice(cursor, openIdx);
-    const inner = content.slice(openIdx + TOOL_CALL_OPEN.length, closeIdx).trim();
+    const inner = content.slice(openIdx + OPEN.length, closeIdx).trim();
 
     try {
       const parsed = JSON.parse(inner);
       if (parsed && typeof parsed.name === 'string') {
         toolCalls.push({
-          id: generateToolCallId(),
-          type: 'function',
+          id: genId(), type: 'function',
           function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments ?? {}) }
         });
-      } else {
-        result += content.slice(openIdx, closeIdx + TOOL_CALL_CLOSE.length);
-      }
+      } else { result += content.slice(openIdx, closeIdx + CLOSE.length); }
     } catch {
-      result += content.slice(openIdx, closeIdx + TOOL_CALL_CLOSE.length);
+      result += content.slice(openIdx, closeIdx + CLOSE.length);
     }
-
-    cursor = closeIdx + TOOL_CALL_CLOSE.length;
+    cursor = closeIdx + CLOSE.length;
   }
-
   return { content: result, toolCalls };
 }
 
-function partialTagSuffixLength(str, tag) {
-  const maxLen = Math.min(str.length, tag.length - 1);
-  for (let i = maxLen; i > 0; i--) {
+function partialLen(str, tag) {
+  const max = Math.min(str.length, tag.length - 1);
+  for (let i = max; i > 0; i--) {
     if (tag.startsWith(str.slice(str.length - i))) return i;
   }
   return 0;
 }
 
 class ToolCallStreamRecovery {
-  constructor() {
-    this.buffer = '';
-    this.toolCallIndex = 0;
-  }
-
+  constructor() { this.buf = ''; this.idx = 0; }
   process(text) {
-    this.buffer += text;
-
-    const toolCallDeltas = [];
-    let outContent = '';
-    let cursor = 0;
+    this.buf += text;
+    const deltas = [];
+    let out = '', cursor = 0;
 
     while (true) {
-      const openIdx = this.buffer.indexOf(TOOL_CALL_OPEN, cursor);
-
-      if (openIdx === -1) {
-        const remaining = this.buffer.slice(cursor);
-        const partialLen = partialTagSuffixLength(remaining, TOOL_CALL_OPEN);
-        const safeLen = remaining.length - partialLen;
-        outContent += remaining.slice(0, safeLen);
-        this.buffer = remaining.slice(safeLen);
+      const o = this.buf.indexOf(OPEN, cursor);
+      if (o === -1) {
+        const rem = this.buf.slice(cursor);
+        const p = partialLen(rem, OPEN);
+        out += rem.slice(0, rem.length - p);
+        this.buf = rem.slice(rem.length - p);
         break;
       }
-
-      const closeIdx = this.buffer.indexOf(TOOL_CALL_CLOSE, openIdx);
-      if (closeIdx === -1) {
-        outContent += this.buffer.slice(cursor, openIdx);
-        this.buffer = this.buffer.slice(openIdx);
+      const c = this.buf.indexOf(CLOSE, o);
+      if (c === -1) {
+        out += this.buf.slice(cursor, o);
+        this.buf = this.buf.slice(o);
         break;
       }
-
-      outContent += this.buffer.slice(cursor, openIdx);
-      const inner = this.buffer.slice(openIdx + TOOL_CALL_OPEN.length, closeIdx).trim();
+      out += this.buf.slice(cursor, o);
+      const inner = this.buf.slice(o + OPEN.length, c).trim();
 
       try {
         const parsed = JSON.parse(inner);
         if (parsed && typeof parsed.name === 'string') {
-          toolCallDeltas.push({
-            index: this.toolCallIndex++,
-            id: generateToolCallId(),
-            type: 'function',
+          deltas.push({
+            index: this.idx++, id: genId(), type: 'function',
             function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments ?? {}) }
           });
-        } else {
-          outContent += this.buffer.slice(openIdx, closeIdx + TOOL_CALL_CLOSE.length);
-        }
-      } catch {
-        outContent += this.buffer.slice(openIdx, closeIdx + TOOL_CALL_CLOSE.length);
-      }
-
-      cursor = closeIdx + TOOL_CALL_CLOSE.length;
+        } else { out += this.buf.slice(o, c + CLOSE.length); }
+      } catch { out += this.buf.slice(o, c + CLOSE.length); }
+      cursor = c + CLOSE.length;
     }
-
-    return { content: outContent, toolCallDeltas };
+    return { content: out, toolCallDeltas: deltas };
   }
-
-  flush() {
-    const leftover = this.buffer;
-    this.buffer = '';
-    return leftover;
-  }
+  flush() { const left = this.buf; this.buf = ''; return left; }
 }
 
 module.exports = { extractLeakedToolCalls, ToolCallStreamRecovery };
