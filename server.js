@@ -1,4 +1,4 @@
-// server.js — Clean OpenAI-compatible proxy for NVIDIA NIM
+// server.js — Clean OpenAI-compatible proxy for NVIDIA NIM (Testing Mode)
 
 const express = require('express');
 const cors = require('cors');
@@ -23,8 +23,9 @@ const MAX_TOKENS_LIMIT = 65536;
 const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS) || 4096;
 const HEARTBEAT_INTERVAL_MS = 10000;
 
-const REQUEST_TIMEOUT_MS = 80000;
-const THINKING_DEADLINE_MS = 80000;
+// Increased timeout to match Playground behavior
+const REQUEST_TIMEOUT_MS = 120000;
+const THINKING_DEADLINE_MS = 120000;
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 const nim = axios.create({ baseURL: NIM_API_BASE, httpsAgent: keepAliveAgent });
@@ -37,12 +38,12 @@ function validateConfig() {
 }
 validateConfig();
 
-// ─── Model Mapping (Verified NIM IDs) ───
+// ─── Model Mapping ───
 const MODEL_MAPPING = {
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
-  'gpt-4-flash': 'z-ai/glm-5.3-flash',
-  'glm-flash': 'z-ai/glm-5.3-flash',
+  'gpt-4-flash': 'z-ai/glm-5.3-flash', 
+  'glm-flash': 'z-ai/glm-5.3-flash',           
   'glm-5.3': 'z-ai/glm-5.3',
   'deepseek': 'deepseek-ai/deepseek-v4.1-flash',
   'deepseek-flash': 'deepseek-ai/deepseek-v4-flash-0731',
@@ -52,7 +53,9 @@ const MODEL_MAPPING = {
 };
 
 const DEFAULT_MODEL = 'meta/llama-3.1-8b-instruct';
-const FALLBACK_MODELS = ['meta/llama-3.1-8b-instruct', 'z-ai/glm-5.3-flash'];
+
+// FALLBACKS REMOVED FOR TESTING
+const FALLBACK_MODELS = [];
 
 function resolveModelId(name) {
   if (typeof name !== 'string') return null;
@@ -124,34 +127,6 @@ async function postToNim(payload, signal) {
   }
 }
 
-const cooldowns = new Map();
-async function callWithFallback(baseReq, models, enableThinking, reasoningEffort, hasTools, signal) {
-  let lastErr = null;
-  const active = models.filter(m => !cooldowns.has(m) || cooldowns.get(m) < Date.now());
-  const order = active.length ? active : models;
-
-  for (const model of order) {
-    if (signal?.aborted) throw lastErr || new Error('Client aborted');
-
-    const payload = { ...baseReq, model, ...getReasoningPayload(model, enableThinking, reasoningEffort) };
-    console.log(`[NIM] Attempting ${model} | payload: ${JSON.stringify(payload.chat_template_kwargs || {})}`);
-
-    try {
-      const res = await postToNim(payload, signal);
-      return { response: res, model };
-    } catch (err) {
-      lastErr = err;
-      const status = err.response?.status;
-      console.warn(`[FALLBACK] ${model} failed | Status: ${status || 'timeout'} | ${getErrorMessage(err)}`);
-
-      if (status === 401) throw err; // Bad API key, no point continuing
-      if (status === 429) cooldowns.set(model, Date.now() + 30000);
-      if (status === 503 || err.timedOut) cooldowns.set(model, Date.now() + 60000);
-    }
-  }
-  throw lastErr || new Error('All models failed');
-}
-
 // ─── Routes ───
 app.get('/', (req, res) => res.send('Proxy is running.'));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
@@ -160,13 +135,16 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  const startTime = Date.now();
   let upstreamStream = null;
   let heartbeat = null;
+  let progressTimer = null;
   let cleanup = null;
   const abortController = new AbortController();
 
   res.on('close', () => {
     if (heartbeat) clearInterval(heartbeat);
+    if (progressTimer) clearInterval(progressTimer);
     if (res.writableFinished) return;
     abortController.abort();
     if (cleanup) cleanup();
@@ -181,28 +159,42 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders();
       safeWrite(res, ': connected\n\n');
-      heartbeat = setInterval(() => safeWrite(res, ': keep-alive\n\n'), HEARTBEAT_INTERVAL_MS);
+      
+      // HEARTBEAT SYSTEM
+      heartbeat = setInterval(() => {
+        safeWrite(res, ': keep-alive\n\n');
+        console.log(`[HEARTBEAT] Sent keep-alive to client (${Math.round((Date.now() - startTime)/1000)}s elapsed)`);
+      }, HEARTBEAT_INTERVAL_MS);
     }
 
     const { model, max_tokens, temperature, reasoning_effort, tools } = req.body;
     const primary = resolveModelId(model) || DEFAULT_MODEL;
-    const chain = [...new Set([primary, ...FALLBACK_MODELS])];
     
+    // NO FALLBACKS
+    const chain = [primary];
+    
+    const hasTools = !!tools;
+
     const baseReq = {
       ...req.body,
       temperature: temperature ?? 0.7,
       max_tokens: Math.min(max_tokens ?? DEFAULT_MAX_TOKENS, MAX_TOKENS_LIMIT),
       stream: isStream
     };
-    delete baseReq.model; delete baseReq.reasoning_effort;
+    delete baseReq.model; 
+    delete baseReq.reasoning_effort;
 
-    const hasTools = !!tools;
-    const { response, model: usedModel } = await callWithFallback(
-      baseReq, chain, ENABLE_THINKING_MODE, reasoning_effort, hasTools, abortController.signal
-    );
+    if (!hasTools && baseReq.stream_options && process.env.KEEP_STREAM_USAGE !== 'true') {
+      delete baseReq.stream_options;
+    }
+
+    const payload = { ...baseReq, model: primary, ...getReasoningPayload(primary, ENABLE_THINKING_MODE, reasoning_effort) };
+    console.log(`[NIM] Sending request to ${primary} | payload: ${JSON.stringify(payload.chat_template_kwargs || {})} ${payload.reasoning_effort ? `(effort: ${payload.reasoning_effort})` : ''}`);
+
+    const response = await postToNim(payload, abortController.signal);
+    const usedModel = primary;
 
     if (!isStream) {
-      // ─── Non-Streaming Path ───
       const data = response.data;
       const choices = (data.choices || []).map((c, i) => {
         const norm = normalizeNonStreamChoice(c, usedModel);
@@ -236,16 +228,24 @@ app.post('/v1/chat/completions', async (req, res) => {
         return { ...norm, index: i, message: finalMsg };
       });
 
+      res.setHeader('X-Response-Time', `${Date.now() - startTime}ms`);
       return res.json({ ...data, model: usedModel, choices });
     }
 
-    // ─── Streaming Path ───
     upstreamStream = response.data;
     const decoder = new StringDecoder('utf8');
     const normalizer = new StreamNormalizer(usedModel);
     const toolRecovery = hasTools ? new ToolCallStreamRecovery() : null;
     
     let buffer = '', reasoningOpen = false, stats = { chars: 0, reason: 0 }, sawTool = false;
+
+    // PROGRESS LOGGER (Every 5 seconds)
+    progressTimer = setInterval(() => {
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      const rTokens = Math.round(stats.reason / 4);
+      const cTokens = Math.round(stats.chars / 4);
+      console.log(`[PROGRESS] ${usedModel} | Elapsed: ${elapsed}s | Reasoning: ~${rTokens} tokens | Content: ~${cTokens} tokens`);
+    }, 5000);
 
     const processLine = (line) => {
       if (!line.startsWith('data: ')) return;
@@ -293,12 +293,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         }
         safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
-      } catch (err) {
-        // Ignore malformed chunks
-      }
+      } catch (err) {}
     };
 
     const onEnd = () => {
+      if (progressTimer) clearInterval(progressTimer);
       buffer += decoder.end();
       if (buffer.trim()) processLine(buffer);
 
@@ -343,11 +342,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { reasoning: outReasoning, reasoning_content: outReasoning }, finish_reason: null }] })}\n\n`);
       }
 
-      // ─── Reasoning Stats Log ───
+      console.log(`[SPEED] ${usedModel} finished stream in ${((Date.now() - startTime)/1000).toFixed(1)}s`);
       if (stats.reason > 0) {
-        console.log(`[REASONING] ${usedModel} thought for ~${Math.round(stats.reason / 4)} tokens (${stats.reason} chars)`);
-      } else {
-        console.log(`[REASONING] ${usedModel} finished without reasoning output`);
+        console.log(`[REASONING] ${usedModel} final tally: ~${Math.round(stats.reason / 4)} reasoning tokens.`);
       }
 
       safeWrite(res, 'data: [DONE]\n\n');
@@ -363,20 +360,28 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     upstreamStream.on('end', onEnd);
     upstreamStream.on('error', (err) => {
+      if (progressTimer) clearInterval(progressTimer);
       if (!res.writableEnded) finishStreamWithNotice(res, `\n\n[Stream Error: ${err.message}]`);
     });
 
     const deadline = setTimeout(() => {
-      if (stats.chars > 0 || sawTool) return;
-      console.log(`[REASONING] ${usedModel} reached deadline without visible output. Aborting.`);
+      if (stats.chars > 0 || stats.reason > 0 || sawTool) return;
+      
+      console.log(`[SPEED] ${usedModel} reached ${THINKING_DEADLINE_MS/1000}s deadline with zero output. Aborting.`);
       if (upstreamStream && !upstreamStream.destroyed) upstreamStream.destroy();
-      finishStreamWithNotice(res, `\n\n[Proxy: Thinking deadline (80s) reached. The model took too long.]`);
+      finishStreamWithNotice(res, `\n\n[Proxy: Deadline (${THINKING_DEADLINE_MS/1000}s) reached without output. The model is too slow.]`);
     }, THINKING_DEADLINE_MS);
 
-    cleanup = () => { clearTimeout(deadline); upstreamStream.removeAllListeners(); upstreamStream.on('error', () => {}); };
+    cleanup = () => { 
+      clearTimeout(deadline); 
+      if (progressTimer) clearInterval(progressTimer); 
+      upstreamStream.removeAllListeners(); 
+      upstreamStream.on('error', () => {}); 
+    };
 
   } catch (err) {
     if (heartbeat) clearInterval(heartbeat);
+    if (progressTimer) clearInterval(progressTimer);
     if (cleanup) cleanup();
     if (abortController.signal.aborted) return;
 
