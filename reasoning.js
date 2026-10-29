@@ -17,97 +17,81 @@ const REASONING_EFFORT_ENUMS = {
   'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
 };
 
-// Values some clients send that mean "no preference"
-const NO_PREFERENCE = new Set(['', 'auto', 'default']);
-
-function normalizeEffort(model, raw) {
-  if (!raw || raw === 'on' || raw === 'off' || NO_PREFERENCE.has(raw)) return undefined;
-  const allowed = REASONING_EFFORT_ENUMS[model];
-  if (allowed && !allowed.includes(raw)) {
-    console.warn(`[REASONING] Dropping invalid effort "${raw}" for ${model}`);
-    return undefined;
-  }
-  return raw;
-}
-
-/**
- * Returns the extra request fields that turn thinking on/off for a model.
- * Thinking is ON when: client sent a valid effort or "on", or ENABLE_THINKING_MODE=true.
- * Thinking is OFF when: client sent "off"/"none", or nothing was requested and the env flag is false.
- * When it is OFF we actively tell the model so, because several NIM models think by default,
- * and that is the #1 reason replies feel slow.
- */
-// Decides whether thinking is on, the effort, and whether this is a "heavy" request
-// (real thinking at medium/high/max effort), which is what deserves a long wait.
-function resolveThinking(model, enableThinking, clientReasoningEffort) {
-  const raw = typeof clientReasoningEffort === 'string' ? clientReasoningEffort.toLowerCase().trim() : undefined;
-  const effort = normalizeEffort(model, raw);
-
-  let thinking;
-  if (raw === 'off' || raw === 'none') thinking = false;
-  else if (raw === 'on' || effort) thinking = true;
-  else thinking = !!enableThinking;
-
-  // GLM is forced to "low" when no effort is given; everything else defaults to high.
-  const effective = effort || (model.startsWith('z-ai/glm') ? 'low' : 'high');
-  const heavy = thinking && !['low', 'minimal'].includes(effective);
-  return { thinking, effort, heavy };
+function resolveEffectiveThinking(enableThinking, clientReasoningEffort) {
+  if (clientReasoningEffort === 'off' || clientReasoningEffort === 'none') return false;
+  if (clientReasoningEffort === 'on') return true;
+  return enableThinking;
 }
 
 function getReasoningPayload(model, enableThinking, clientReasoningEffort) {
-  const { thinking, effort } = resolveThinking(model, enableThinking, clientReasoningEffort);
+  const thinkingOn = resolveEffectiveThinking(enableThinking, clientReasoningEffort);
+  
+  // Use raw effort for deepseek logic, validated effort for payloads
+  const rawEffort = (clientReasoningEffort === 'off' || clientReasoningEffort === 'on') 
+    ? undefined : clientReasoningEffort;
+  
+  let effort = rawEffort;
+  const allowed = REASONING_EFFORT_ENUMS[model];
+  if (allowed && effort && !allowed.includes(effort)) {
+    console.warn(`[REASONING] Dropping invalid effort "${effort}" for ${model}`);
+    effort = undefined;
+  }
 
   switch (model) {
-    // ─── DeepSeek ───
+    // ─── DeepSeek (Requires chat_template_kwargs + thinking flag) ───
     case 'deepseek-ai/deepseek-v4.1-flash':
     case 'deepseek-ai/deepseek-v4-flash-0731': {
-      if (!thinking) return { chat_template_kwargs: { thinking: false } };
-      return { chat_template_kwargs: { thinking: true, reasoning_effort: effort || 'high' } };
+      const wantsThinking = clientReasoningEffort === 'on' || !!rawEffort || thinkingOn;
+      if (!wantsThinking) return { chat_template_kwargs: { thinking: false } };
+      return { 
+        chat_template_kwargs: { 
+          thinking: true, 
+          reasoning_effort: effort || 'high' 
+        } 
+      };
     }
 
-    // ─── GLM 5.3 (NIM default is max effort, which is very slow) ───
+    // ─── GLM 5.3 (Defaults to max in NIM, force low to prevent timeouts) ───
     case 'z-ai/glm-5.3':
     case 'z-ai/glm-5.3-flash': {
-      if (!thinking) {
-        return {
-          reasoning_effort: 'low',
-          chat_template_kwargs: { enable_thinking: false, reasoning_effort: 'low', clear_thinking: true }
-        };
-      }
-      const level = effort || 'low';
-      return { reasoning_effort: level, chat_template_kwargs: { reasoning_effort: level, clear_thinking: true } };
+      const level = effort || 'low'; 
+      return {
+        reasoning_effort: level,
+        chat_template_kwargs: { reasoning_effort: level, clear_thinking: true }
+      };
     }
 
-    // ─── Nemotron 3 Ultra ───
+    // ─── Nemotron 3 Ultra (Uses reasoning_budget + effort) ───
     case 'nvidia/nemotron-3-ultra-550b-a55b': {
-      if (!thinking) return { reasoning_effort: 'none' };
-      return { reasoning_effort: effort || 'high', reasoning_budget: 16384 };
+      if (!thinkingOn) return { reasoning_effort: 'none' };
+      return { 
+        reasoning_effort: effort || 'high',
+        reasoning_budget: 16384 // NIM docs default
+      };
     }
 
-    // ─── Nemotron 3 Super (thinks by default unless told otherwise) ───
+    // ─── Nemotron 3 Super (Standard enable_thinking) ───
     case 'nvidia/nemotron-3-super-120b-a12b': {
-      return { chat_template_kwargs: { enable_thinking: thinking } };
+      if (!thinkingOn) return {};
+      return { chat_template_kwargs: { enable_thinking: true } };
     }
 
-    // ─── gpt-oss (cannot fully disable reasoning, so use the cheapest level) ───
+    // ─── Standard OpenAI-style reasoning_effort ───
     case 'openai/gpt-oss-120b':
-    case 'openai/gpt-oss-20b': {
-      if (effort) return { reasoning_effort: effort };
-      return { reasoning_effort: thinking ? 'high' : 'low' };
-    }
-
+    case 'openai/gpt-oss-20b':
     case 'moonshotai/kimi-k3': {
       if (effort) return { reasoning_effort: effort };
-      if (thinking) return { reasoning_effort: 'high' };
+      if (thinkingOn) return { reasoning_effort: 'high' };
       return {};
     }
 
+    // ─── Models with custom thinking modes ───
     case 'minimaxai/minimax-m3': {
-      return { chat_template_kwargs: { thinking_mode: thinking ? 'enabled' : 'disabled' } };
+      return { chat_template_kwargs: { thinking_mode: thinkingOn ? 'enabled' : 'disabled' } };
     }
 
     default:
-      if (thinking) return { chat_template_kwargs: { enable_thinking: true } };
+      if (thinkingOn) return { chat_template_kwargs: { enable_thinking: true } };
       return {};
   }
 }
@@ -141,7 +125,7 @@ class DelimiterParser {
     return { content, reasoning };
   }
   flush() {
-    const out = { content: '', reasoning: '' };
+    let out = { content: '', reasoning: '' };
     if (this.buf) { if (this.in) out.reasoning = this.buf; else out.content = this.buf; this.buf = ''; }
     return out;
   }
@@ -186,4 +170,4 @@ function normalizeNonStreamChoice(choice, model) {
   return { ...choice, message: newMsg };
 }
 
-module.exports = { SHOW_REASONING, getReasoningPayload, resolveThinking, StreamNormalizer, normalizeNonStreamChoice };
+module.exports = { SHOW_REASONING, getReasoningPayload, StreamNormalizer, normalizeNonStreamChoice };
