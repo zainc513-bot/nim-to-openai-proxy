@@ -1,4 +1,4 @@
-// server.js — OpenAI-compatible proxy for NVIDIA NIM (v6.1)
+// server.js — Clean OpenAI-compatible proxy for NVIDIA NIM
 
 const express = require('express');
 const cors = require('cors');
@@ -6,15 +6,13 @@ const axios = require('axios');
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
 const { timingSafeEqual, createHash } = require('crypto');
-const { SHOW_REASONING, getReasoningPayload, resolveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
+const { SHOW_REASONING, getReasoningPayload, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
 const { extractLeakedToolCalls, ToolCallStreamRecovery } = require('./tools');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ─── Configuration ───
-const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; };
-
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 const CLIENT_AUTH_KEY = process.env.CLIENT_AUTH_KEY;
@@ -22,26 +20,22 @@ const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 
 const MAX_TOKENS_LIMIT = 65536;
-const DEFAULT_MAX_TOKENS = num(process.env.DEFAULT_MAX_TOKENS, 4096);
+const DEFAULT_MAX_TOKENS = Number(process.env.DEFAULT_MAX_TOKENS) || 4096;
 const HEARTBEAT_INTERVAL_MS = 10000;
 
-// Speed controls. The important one is FIRST_TOKEN_TIMEOUT_MS: if a model has not produced
-// anything by then, we give up on it and move to the next model in the chain.
-// Two tiers: "heavy" = thinking at medium/high/max effort (long wait is fine), "fast" = thinking off or low effort.
-const FIRST_TOKEN_TIMEOUT_MS = num(process.env.FIRST_TOKEN_TIMEOUT_THINKING_MS, 120000); // streaming, heavy thinking
-const FIRST_TOKEN_TIMEOUT_FAST_MS = num(process.env.FIRST_TOKEN_TIMEOUT_MS, 45000);      // streaming, thinking off/low
-const STREAM_IDLE_TIMEOUT_MS = num(process.env.STREAM_IDLE_TIMEOUT_MS, 120000); // streaming: max silence mid-reply
-const NON_STREAM_TIMEOUT_MS = num(process.env.REQUEST_TIMEOUT_THINKING_MS, 180000); // non-streaming, heavy thinking
-const NON_STREAM_TIMEOUT_FAST_MS = num(process.env.REQUEST_TIMEOUT_MS, 90000);      // non-streaming, thinking off/low
-const TOTAL_BUDGET_MS = num(process.env.TOTAL_BUDGET_MS, 300000);              // all fallbacks combined
+const REQUEST_TIMEOUT_MS = 80000;
+const THINKING_DEADLINE_MS = 80000;
 
-const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10000 });
+const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 const nim = axios.create({ baseURL: NIM_API_BASE, httpsAgent: keepAliveAgent });
 
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 
-if (!NIM_API_KEY) { console.error('[FATAL] NIM_API_KEY is required.'); process.exit(1); }
-if (!CLIENT_AUTH_KEY) console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected.');
+function validateConfig() {
+  if (!NIM_API_KEY) { console.error('[FATAL] NIM_API_KEY is required.'); process.exit(1); }
+  if (!CLIENT_AUTH_KEY) console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected.');
+}
+validateConfig();
 
 // ─── Model Mapping (Verified NIM IDs) ───
 const MODEL_MAPPING = {
@@ -52,45 +46,19 @@ const MODEL_MAPPING = {
   'glm-5.3': 'z-ai/glm-5.3',
   'deepseek': 'deepseek-ai/deepseek-v4.1-flash',
   'deepseek-flash': 'deepseek-ai/deepseek-v4-flash-0731',
+  'llama-3.1-8b': 'meta/llama-3.1-8b-instruct',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'm3': 'minimaxai/minimax-m3'
 };
 
-// Optional: MODEL_MAP_JSON='{"gpt-4o":"deepseek-ai/deepseek-v4-pro-0813"}' adds/overrides aliases without editing code.
-try {
-  if (process.env.MODEL_MAP_JSON) Object.assign(MODEL_MAPPING, JSON.parse(process.env.MODEL_MAP_JSON));
-} catch (e) { console.warn(`[CONFIG] MODEL_MAP_JSON ignored: ${e.message}`); }
-
-// meta/llama-3.1-8b-instruct reached end of life on NIM (HTTP 410), so it is no longer used.
-const DEFAULT_MODEL = 'google/gemma-4-31b-it';
-const FALLBACK_MODELS = process.env.FALLBACK_MODELS
-  ? process.env.FALLBACK_MODELS.split(',').map(s => s.trim()).filter(Boolean)
-  : ['google/gemma-4-31b-it', 'z-ai/glm-5.3-flash'];
+const DEFAULT_MODEL = 'meta/llama-3.1-8b-instruct';
+const FALLBACK_MODELS = ['meta/llama-3.1-8b-instruct', 'z-ai/glm-5.3-flash'];
 
 function resolveModelId(name) {
   if (typeof name !== 'string') return null;
   if (MODEL_MAPPING[name]) return MODEL_MAPPING[name];
   if (/^[\w.-]+\/[\w.:-]+$/.test(name)) return name;
-  console.warn(`[MODEL] Unknown alias "${name}", using default ${DEFAULT_MODEL}`);
   return null;
-}
-
-// Only forward standard OpenAI fields. Unknown extras from clients are a common cause of 400s.
-const PASSTHROUGH = new Set([
-  'messages', 'temperature', 'top_p', 'stop', 'frequency_penalty', 'presence_penalty',
-  'seed', 'response_format', 'tools', 'tool_choice',
-  ...(process.env.EXTRA_PARAMS || '').split(',').map(s => s.trim()).filter(Boolean)
-]);
-
-function buildUpstreamRequest(body, isStream) {
-  const out = {};
-  for (const k of PASSTHROUGH) if (body[k] !== undefined && body[k] !== null) out[k] = body[k];
-  if (!Array.isArray(out.tools) || out.tools.length === 0) { delete out.tools; delete out.tool_choice; }
-  out.temperature = body.temperature ?? 0.7;
-  const requested = Number(body.max_tokens ?? body.max_completion_tokens);
-  out.max_tokens = Math.min(requested > 0 ? requested : DEFAULT_MAX_TOKENS, MAX_TOKENS_LIMIT);
-  out.stream = isStream;
-  return out;
 }
 
 // ─── Middleware ───
@@ -103,9 +71,8 @@ function safeTimingEqual(a, b) {
 }
 
 app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') return next();
   if (req.path === '/health' || req.path === '/' || req.path === '/v1/models') return next();
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  const token = req.headers.authorization?.replace('Bearer ', '').trim();
   if (!token || !CLIENT_AUTH_KEY || !safeTimingEqual(token, CLIENT_AUTH_KEY)) {
     return res.status(403).json({ error: { message: 'Forbidden', type: 'authentication_error', code: 403 } });
   }
@@ -118,168 +85,68 @@ function safeWrite(res, data) {
 }
 
 function finishStreamWithNotice(res, text) {
-  if (text) safeWrite(res, `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`);
-  safeWrite(res, `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+  if (text) {
+    safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: null }] })}\n\n`);
+  }
+  safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`);
   safeWrite(res, 'data: [DONE]\n\n');
-  if (!res.writableEnded) { try { res.end(); } catch {} }
+  if (!res.writableEnded) res.end();
 }
 
 function getErrorMessage(err) {
   if (!err) return 'Unknown error';
   const d = err.response?.data;
-  const msg = typeof d === 'string' ? d : d?.error?.message || d?.message || d?.detail;
+  let msg = typeof d === 'string' ? d : d?.error?.message || d?.message || d?.detail;
   return String(msg || err.message || 'Request failed').slice(0, 300);
 }
 
-// When we ask axios for a stream and NIM answers 4xx/5xx, the error body is a stream. Read it so errors are readable.
-async function readErrorBody(err) {
-  const d = err?.response?.data;
-  if (!d || typeof d.on !== 'function') return err;
-  try {
-    const chunks = [];
-    let size = 0;
-    await new Promise((resolve) => {
-      const t = setTimeout(resolve, 2000);
-      const done = () => { clearTimeout(t); resolve(); };
-      d.on('data', c => { if (size < 4096) { chunks.push(c); size += c.length; } });
-      d.on('end', done);
-      d.on('error', done);
-    });
-    if (!d.destroyed) d.destroy();
-    const text = Buffer.concat(chunks).toString('utf8');
-    try { err.response.data = JSON.parse(text); } catch { err.response.data = text; }
-  } catch {}
-  return err;
-}
-
-/**
- * One upstream attempt.
- *  - non-stream: resolves { data } once the whole body has arrived (timeout covers the whole reply)
- *  - stream:     resolves { stream, firstChunk } as soon as the model emits its FIRST chunk.
- *                The stream is left paused so the caller can attach listeners without losing data.
- */
-async function openOnce(payload, isStream, signal, timeoutMs) {
+async function postToNim(payload, signal) {
   const ac = new AbortController();
   let timedOut = false;
   const onAbort = () => ac.abort();
-  if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', onAbort, { once: true }); }
-  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
-  const disarm = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
-  const toError = (err) => {
-    disarm();
-    if (timedOut) {
-      const e = new Error(`Model produced no output within ${Math.round(timeoutMs / 1000)}s`);
-      e.timedOut = true;
-      return e;
-    }
-    return err;
-  };
+  if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener('abort', onAbort); }
+  
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, REQUEST_TIMEOUT_MS);
 
-  let res;
   try {
-    res = await nim.post('/chat/completions', payload, {
-      headers: {
-        Authorization: `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json',
-        ...(isStream ? { Accept: 'text/event-stream', 'Accept-Encoding': 'identity' } : {})
-      },
-      responseType: isStream ? 'stream' : 'json',
-      timeout: 0,
-      signal: ac.signal
+    const res = await nim.post('/chat/completions', payload, {
+      headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
+      responseType: payload.stream ? 'stream' : 'json',
+      timeout: 0, signal: ac.signal
     });
+    return res;
   } catch (err) {
-    if (isStream) await readErrorBody(err);
-    throw toError(err);
-  }
-
-  if (!isStream) { disarm(); return { data: res.data }; }
-
-  const stream = res.data;
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const cleanup = () => {
-      stream.removeListener('data', onData);
-      stream.removeListener('error', onError);
-      stream.removeListener('end', onEmpty);
-      stream.removeListener('close', onEmpty);
-    };
-    const onData = (chunk) => {
-      if (settled) return;
-      settled = true; cleanup(); stream.pause(); disarm();
-      stream.on('error', () => {}); // never let a late error crash the process
-      resolve({ stream, firstChunk: chunk });
-    };
-    const onError = (err) => {
-      if (settled) return;
-      settled = true; cleanup();
-      reject(toError(err));
-    };
-    const onEmpty = () => {
-      if (settled) return;
-      settled = true; cleanup();
-      const e = toError(new Error('Model closed the stream without output'));
-      reject(e);
-    };
-    stream.on('data', onData);
-    stream.on('error', onError);
-    stream.on('end', onEmpty);
-    stream.on('close', onEmpty);
-  });
-}
-
-// Keep-alive sockets can be closed by the server while idle; retry once on a reset.
-async function openUpstream(payload, isStream, signal, timeoutMs) {
-  try {
-    return await openOnce(payload, isStream, signal, timeoutMs);
-  } catch (err) {
-    if (['ECONNRESET', 'EPIPE'].includes(err.code) && !signal?.aborted) {
-      return openOnce(payload, isStream, signal, timeoutMs);
-    }
+    if (timedOut) { const e = new Error(`Timeout after ${REQUEST_TIMEOUT_MS}ms`); e.timedOut = true; throw e; }
     throw err;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
 
 const cooldowns = new Map();
-
-async function callWithFallback({ baseReq, models, effort, isStream, signal }) {
-  const started = Date.now();
-  const active = models.filter(m => (cooldowns.get(m) || 0) <= started);
-  const order = active.length ? active : models;
+async function callWithFallback(baseReq, models, enableThinking, reasoningEffort, hasTools, signal) {
   let lastErr = null;
+  const active = models.filter(m => !cooldowns.has(m) || cooldowns.get(m) < Date.now());
+  const order = active.length ? active : models;
 
   for (const model of order) {
     if (signal?.aborted) throw lastErr || new Error('Client aborted');
-    const remaining = TOTAL_BUDGET_MS - (Date.now() - started);
-    if (lastErr && remaining < 3000) break;
-    const { heavy } = resolveThinking(model, ENABLE_THINKING_MODE, effort);
-    const perAttempt = isStream
-      ? (heavy ? FIRST_TOKEN_TIMEOUT_MS : FIRST_TOKEN_TIMEOUT_FAST_MS)
-      : (heavy ? NON_STREAM_TIMEOUT_MS : NON_STREAM_TIMEOUT_FAST_MS);
-    const timeoutMs = Math.max(3000, Math.min(perAttempt, remaining));
 
-    // First try with reasoning params; if NIM rejects them (400/422), retry the same model without.
-    const reasoning = getReasoningPayload(model, ENABLE_THINKING_MODE, effort);
-    const variants = Object.keys(reasoning).length ? [reasoning, {}] : [{}];
+    const payload = { ...baseReq, model, ...getReasoningPayload(model, enableThinking, reasoningEffort) };
+    console.log(`[NIM] Attempting ${model} | payload: ${JSON.stringify(payload.chat_template_kwargs || {})}`);
 
-    for (let v = 0; v < variants.length; v++) {
-      const payload = { ...baseReq, model, ...variants[v] };
-      const t0 = Date.now();
-      console.log(`[NIM] -> ${model}${v ? ' (without reasoning params)' : ''} ${JSON.stringify(variants[v])}`);
-      try {
-        const opened = await openUpstream(payload, isStream, signal, timeoutMs);
-        return { ...opened, model, waitedMs: Date.now() - t0 };
-      } catch (err) {
-        lastErr = err;
-        const status = err.response?.status;
-        console.warn(`[FALLBACK] ${model} failed after ${Date.now() - t0}ms | ${status || (err.timedOut ? 'timeout' : err.code || 'error')} | ${getErrorMessage(err)}`);
-        if (signal?.aborted) throw err;
-        if (status === 401) throw err; // bad NIM key: no point trying other models
-        if ((status === 400 || status === 422) && v < variants.length - 1) continue;
-        if (status === 429) cooldowns.set(model, Date.now() + 30000);
-        else if (status === 404 || status === 410) cooldowns.set(model, Date.now() + 60 * 60000); // gone / end of life
-        else if (status === 503 || status === 504 || err.timedOut) cooldowns.set(model, Date.now() + 60000);
-        break;
-      }
+    try {
+      const res = await postToNim(payload, signal);
+      return { response: res, model };
+    } catch (err) {
+      lastErr = err;
+      const status = err.response?.status;
+      console.warn(`[FALLBACK] ${model} failed | Status: ${status || 'timeout'} | ${getErrorMessage(err)}`);
+
+      if (status === 401) throw err; // Bad API key, no point continuing
+      if (status === 429) cooldowns.set(model, Date.now() + 30000);
+      if (status === 503 || err.timedOut) cooldowns.set(model, Date.now() + 60000);
     }
   }
   throw lastErr || new Error('All models failed');
@@ -293,273 +160,244 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-  const body = req.body || {};
-  if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return res.status(400).json({ error: { message: '`messages` must be a non-empty array', type: 'invalid_request_error', code: 400 } });
-  }
-
-  const isStream = !!body.stream;
-  const inline = SHOW_REASONING && req.headers['x-reasoning-format'] === 'inline';
-  const reqStart = Date.now();
+  let upstreamStream = null;
+  let heartbeat = null;
+  let cleanup = null;
   const abortController = new AbortController();
-  let upstream = null, heartbeat = null, idleTimer = null, finished = false;
 
-  const teardown = () => {
-    if (heartbeat) clearInterval(heartbeat);
-    if (idleTimer) clearTimeout(idleTimer);
-    if (upstream && !upstream.destroyed) upstream.destroy();
-  };
   res.on('close', () => {
-    if (!res.writableFinished) abortController.abort();
-    finished = true;
-    teardown();
+    if (heartbeat) clearInterval(heartbeat);
+    if (res.writableFinished) return;
+    abortController.abort();
+    if (cleanup) cleanup();
+    if (upstreamStream && !upstreamStream.destroyed) upstreamStream.destroy();
   });
 
   try {
+    const isStream = !!req.body.stream;
     if (isStream) {
-      res.status(200);
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no'); // stop nginx-style proxies from buffering the stream
       res.flushHeaders();
-      try { res.socket?.setNoDelay(true); } catch {}
       safeWrite(res, ': connected\n\n');
       heartbeat = setInterval(() => safeWrite(res, ': keep-alive\n\n'), HEARTBEAT_INTERVAL_MS);
     }
 
-    const primary = resolveModelId(body.model) || DEFAULT_MODEL;
+    const { model, max_tokens, temperature, reasoning_effort, tools } = req.body;
+    const primary = resolveModelId(model) || DEFAULT_MODEL;
     const chain = [...new Set([primary, ...FALLBACK_MODELS])];
-    const baseReq = buildUpstreamRequest(body, isStream);
-    const hasTools = !!baseReq.tools;
+    
+    const baseReq = {
+      ...req.body,
+      temperature: temperature ?? 0.7,
+      max_tokens: Math.min(max_tokens ?? DEFAULT_MAX_TOKENS, MAX_TOKENS_LIMIT),
+      stream: isStream
+    };
+    delete baseReq.model; delete baseReq.reasoning_effort;
 
-    const opened = await callWithFallback({
-      baseReq, models: chain, effort: body.reasoning_effort, isStream, signal: abortController.signal
-    });
-    const usedModel = opened.model;
-    console.log(`[NIM] ${usedModel} answered after ${opened.waitedMs}ms (${isStream ? 'first chunk' : 'full reply'})`);
+    const hasTools = !!tools;
+    const { response, model: usedModel } = await callWithFallback(
+      baseReq, chain, ENABLE_THINKING_MODE, reasoning_effort, hasTools, abortController.signal
+    );
 
-    // ─── Non-Streaming Path ───
     if (!isStream) {
-      const data = opened.data;
+      // ─── Non-Streaming Path ───
+      const data = response.data;
       const choices = (data.choices || []).map((c, i) => {
         const norm = normalizeNonStreamChoice(c, usedModel);
-        const msg = { ...norm.message };
-        let content = msg.content || '';
-        const reasoning = msg.reasoning || '';
-        let finish = norm.finish_reason;
+        let content = norm.message?.content || '';
+        let reasoning = norm.message?.reasoning || '';
+        
+        if (reasoning.length > 0) {
+          console.log(`[REASONING] ${usedModel} thought for ~${Math.round(reasoning.length / 4)} tokens (${reasoning.length} chars)`);
+        } else {
+          console.log(`[REASONING] ${usedModel} finished without reasoning output`);
+        }
 
-        if (hasTools && content) {
+        let recovered = [];
+        if (hasTools) {
           const r = extractLeakedToolCalls(content);
-          content = r.content;
-          if (r.toolCalls.length) {
-            msg.tool_calls = [...(msg.tool_calls || []), ...r.toolCalls];
-            finish = 'tool_calls';
-          }
+          content = r.content; recovered = r.toolCalls;
         }
-        msg.content = content || (msg.tool_calls?.length ? null : '');
 
-        delete msg.reasoning; delete msg.reasoning_content;
-        if (SHOW_REASONING && reasoning) {
-          if (inline) msg.content = `<thinking>\n${reasoning}\n</thinking>\n\n${msg.content || ''}`;
-          else { msg.reasoning = reasoning; msg.reasoning_content = reasoning; }
+        const finalMsg = { ...norm.message, content };
+        const allTools = [...(norm.message.tool_calls || []), ...recovered];
+        
+        if (allTools.length > 0) {
+          finalMsg.tool_calls = allTools;
+          if (recovered.length > 0) norm.finish_reason = 'tool_calls';
+          if (!finalMsg.content) finalMsg.content = null;
         }
-        console.log(`[REASONING] ${usedModel} ${reasoning ? `thought ~${Math.round(reasoning.length / 4)} tokens` : 'no reasoning output'}`);
-        return { ...norm, index: i, message: msg, finish_reason: finish };
+
+        if (!SHOW_REASONING) { delete finalMsg.reasoning; delete finalMsg.reasoning_content; }
+        else if (finalMsg.reasoning) finalMsg.reasoning_content = finalMsg.reasoning;
+
+        return { ...norm, index: i, message: finalMsg };
       });
-      finished = true;
-      console.log(`[DONE] ${usedModel} non-stream total ${Date.now() - reqStart}ms`);
+
       return res.json({ ...data, model: usedModel, choices });
     }
 
     // ─── Streaming Path ───
-    upstream = opened.stream;
+    upstreamStream = response.data;
     const decoder = new StringDecoder('utf8');
     const normalizer = new StreamNormalizer(usedModel);
     const toolRecovery = hasTools ? new ToolCallStreamRecovery() : null;
+    
+    let buffer = '', reasoningOpen = false, stats = { chars: 0, reason: 0 }, sawTool = false;
 
-    const st = {
-      id: `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-      created: Math.floor(Date.now() / 1000),
-      finishReason: null, recoveredTool: false, reasoningOpen: false,
-      visible: 0, reasoned: 0, firstVisibleAt: null
-    };
-    let buffer = '';
+    const processLine = (line) => {
+      if (!line.startsWith('data: ')) return;
+      if (line.trim() === 'data: [DONE]') return;
 
-    const emit = (obj) => safeWrite(res, `data: ${JSON.stringify(obj)}\n\n`);
-    const emitDelta = (delta, finish = null) => emit({
-      id: st.id, object: 'chat.completion.chunk', created: st.created, model: usedModel,
-      choices: [{ index: 0, delta, finish_reason: finish }]
-    });
+      try {
+        const data = JSON.parse(line.slice(6));
+        const delta = data.choices?.[0]?.delta;
+        if (delta && delta.tool_calls) sawTool = true;
 
-    // Turns (reasoning, content) into what we actually send to the client
-    const render = (reasoning, content) => {
-      if (!SHOW_REASONING) return { content: content || '' };
-      if (!inline) return { content: content || '', reasoning: reasoning || '' };
-      let out = '';
-      if (reasoning) {
-        if (!st.reasoningOpen) { out += '<thinking>\n'; st.reasoningOpen = true; }
-        out += reasoning;
+        if (delta) {
+          const norm = normalizer.processDelta(delta);
+          stats.chars += (norm.content || '').length;
+          if (norm.reasoning) stats.reason += norm.reasoning.length;
+
+          let outContent = '';
+          if (SHOW_REASONING && req.headers['x-reasoning-format'] === 'inline') {
+            if (norm.reasoning && !reasoningOpen) { outContent += `<thinking>\n${norm.reasoning}`; reasoningOpen = true; }
+            else if (norm.reasoning) outContent += norm.reasoning;
+
+            if (norm.content && reasoningOpen) { outContent += `\n</thinking>\n\n${norm.content}`; reasoningOpen = false; }
+            else if (norm.content) outContent += norm.content;
+          } else {
+            outContent = norm.content || '';
+          }
+
+          if (toolRecovery) {
+            const r = toolRecovery.process(outContent);
+            outContent = r.content;
+            if (r.toolCallDeltas.length > 0) {
+              sawTool = true;
+              delta.tool_calls = [...(delta.tool_calls || []), ...r.toolCallDeltas];
+              if (data.choices[0]) data.choices[0].finish_reason = 'tool_calls';
+            }
+          }
+
+          if (outContent) delta.content = outContent; else delete delta.content;
+          
+          if (SHOW_REASONING && norm.reasoning) {
+            delta.reasoning = norm.reasoning;
+            delta.reasoning_content = norm.reasoning;
+          } else {
+            delete delta.reasoning;
+            delete delta.reasoning_content;
+          }
+        }
+        safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
+      } catch (err) {
+        // Ignore malformed chunks
       }
-      if (content) {
-        if (st.reasoningOpen) { out += '\n</thinking>\n\n'; st.reasoningOpen = false; }
-        out += content;
-      }
-      return { content: out };
-    };
-
-    const handleData = (data) => {
-      if (data.error && !data.choices) {
-        emitDelta({ content: `\n\n[Upstream error: ${String(data.error.message || data.error).slice(0, 200)}]` });
-        return;
-      }
-      const choice = data.choices?.[0];
-      if (!choice) { emit(data); return; } // e.g. usage-only chunk
-
-      // Hold the finish_reason back: it is sent once at the very end, after everything has been flushed.
-      if (choice.finish_reason) { st.finishReason = choice.finish_reason; choice.finish_reason = null; }
-
-      const norm = normalizer.processDelta(choice.delta || {});
-      let content = norm.content || '';
-      const reasoning = norm.reasoning || '';
-      let recovered = [];
-
-      if (toolRecovery && content) {
-        const r = toolRecovery.process(content);
-        content = r.content; recovered = r.toolCallDeltas;
-      }
-
-      const out = { ...norm };
-      delete out.content; delete out.reasoning; delete out.reasoning_content;
-      const r = render(reasoning, content);
-      if (r.content) out.content = r.content;
-      if (r.reasoning) { out.reasoning = r.reasoning; out.reasoning_content = r.reasoning; }
-      if (recovered.length) {
-        out.tool_calls = [...(out.tool_calls || []), ...recovered];
-        st.recoveredTool = true;
-      }
-
-      st.visible += content.length;
-      st.reasoned += reasoning.length;
-      if (content && !st.firstVisibleAt) st.firstVisibleAt = Date.now() - reqStart;
-
-      if (Object.keys(out).length === 0 && !data.usage) return; // nothing to forward
-      data.choices[0] = { ...choice, delta: out };
-      emit(data);
     };
 
-    const processLine = (raw) => {
-      const line = raw.trim();
-      if (!line.startsWith('data:')) return;
-      const payload = line.slice(5).trim();
-      if (!payload || payload === '[DONE]') return;
-      let data;
-      try { data = JSON.parse(payload); } catch { return; }
-      try { handleData(data); } catch (e) { console.warn(`[STREAM] chunk error: ${e.message}`); }
-    };
-
-    const finalize = () => {
-      if (finished) return;
-      finished = true;
-      if (idleTimer) clearTimeout(idleTimer);
-
+    const onEnd = () => {
       buffer += decoder.end();
-      if (buffer.trim()) { buffer.split('\n').forEach(processLine); buffer = ''; }
+      if (buffer.trim()) processLine(buffer);
 
       const flushed = normalizer.flush();
-      let content = flushed.content || '';
-      const reasoning = flushed.reasoning || '';
-      let tools = [];
+      let outContent = flushed.content || '';
+      const outReasoning = flushed.reasoning || '';
+      let flushedTools = [];
+
+      if (outReasoning) stats.reason += outReasoning.length;
+
       if (toolRecovery) {
-        if (content) { const r = toolRecovery.process(content); content = r.content; tools = r.toolCallDeltas; }
-        content += toolRecovery.flush();
+        const r = toolRecovery.process(outContent);
+        outContent = r.content; flushedTools = r.toolCallDeltas;
+        const left = toolRecovery.flush();
+        if (left) outContent += left;
       }
-      st.visible += content.length; st.reasoned += reasoning.length;
 
-      const r = render(reasoning, content);
-      let tail = r.content || '';
-      if (st.reasoningOpen) { tail += '\n</thinking>\n\n'; st.reasoningOpen = false; }
-      const out = {};
-      if (tail) out.content = tail;
-      if (r.reasoning) { out.reasoning = r.reasoning; out.reasoning_content = r.reasoning; }
-      if (tools.length) { out.tool_calls = tools; st.recoveredTool = true; }
-      if (Object.keys(out).length) emitDelta(out);
+      if (flushedTools.length > 0) {
+        safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: flushedTools }, finish_reason: 'tool_calls' }] })}\n\n`);
+      }
 
-      emitDelta({}, st.recoveredTool ? 'tool_calls' : (st.finishReason || 'stop'));
-      console.log(`[REASONING] ${usedModel} ${st.reasoned ? `thought ~${Math.round(st.reasoned / 4)} tokens` : 'no reasoning output'}`);
-      console.log(`[DONE] ${usedModel} stream total ${Date.now() - reqStart}ms | first text at ${st.firstVisibleAt ?? 'n/a'}ms | ${st.visible} chars`);
+      let finalContent = '';
+      if (SHOW_REASONING && req.headers['x-reasoning-format'] === 'inline') {
+        if (outReasoning) {
+          if (!reasoningOpen) { finalContent = `<thinking>\n${outReasoning}`; reasoningOpen = true; }
+          else finalContent = outReasoning;
+        }
+        if (outContent) {
+          if (reasoningOpen) { finalContent += `\n</thinking>\n\n${outContent}`; reasoningOpen = false; }
+          else finalContent += outContent;
+        }
+        if (reasoningOpen) finalContent += '\n</thinking>\n\n';
+      } else {
+        finalContent = outContent;
+      }
+
+      if (finalContent) {
+        safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: finalContent }, finish_reason: null }] })}\n\n`);
+      }
+
+      if (SHOW_REASONING && !req.headers['x-reasoning-format'] && outReasoning) {
+        safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { reasoning: outReasoning, reasoning_content: outReasoning }, finish_reason: null }] })}\n\n`);
+      }
+
+      // ─── Reasoning Stats Log ───
+      if (stats.reason > 0) {
+        console.log(`[REASONING] ${usedModel} thought for ~${Math.round(stats.reason / 4)} tokens (${stats.reason} chars)`);
+      } else {
+        console.log(`[REASONING] ${usedModel} finished without reasoning output`);
+      }
+
       safeWrite(res, 'data: [DONE]\n\n');
-      if (!res.writableEnded) { try { res.end(); } catch {} }
+      if (!res.writableEnded) res.end();
     };
 
-    const armIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        if (finished) return;
-        finished = true;
-        console.warn(`[STREAM] ${usedModel} went silent for ${STREAM_IDLE_TIMEOUT_MS / 1000}s, aborting`);
-        if (upstream && !upstream.destroyed) upstream.destroy();
-        finishStreamWithNotice(res, `\n\n[Proxy: model stopped responding for ${Math.round(STREAM_IDLE_TIMEOUT_MS / 1000)}s]`);
-      }, STREAM_IDLE_TIMEOUT_MS);
-    };
-
-    const onChunk = (chunk) => {
-      if (finished) return;
-      armIdle();
+    upstreamStream.on('data', chunk => {
       buffer += decoder.write(chunk);
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
       for (const line of lines) processLine(line);
-    };
-
-    upstream.on('end', finalize);
-    upstream.on('close', finalize);
-    upstream.on('error', (err) => {
-      if (finished) return;
-      finished = true;
-      finishStreamWithNotice(res, `\n\n[Stream Error: ${err.message}]`);
     });
 
-    // Process the chunk we already consumed to detect "model is alive", then continue streaming.
-    onChunk(opened.firstChunk);
-    upstream.on('data', onChunk);
-    upstream.resume();
+    upstreamStream.on('end', onEnd);
+    upstreamStream.on('error', (err) => {
+      if (!res.writableEnded) finishStreamWithNotice(res, `\n\n[Stream Error: ${err.message}]`);
+    });
+
+    const deadline = setTimeout(() => {
+      if (stats.chars > 0 || sawTool) return;
+      console.log(`[REASONING] ${usedModel} reached deadline without visible output. Aborting.`);
+      if (upstreamStream && !upstreamStream.destroyed) upstreamStream.destroy();
+      finishStreamWithNotice(res, `\n\n[Proxy: Thinking deadline (80s) reached. The model took too long.]`);
+    }, THINKING_DEADLINE_MS);
+
+    cleanup = () => { clearTimeout(deadline); upstreamStream.removeAllListeners(); upstreamStream.on('error', () => {}); };
 
   } catch (err) {
-    teardown();
+    if (heartbeat) clearInterval(heartbeat);
+    if (cleanup) cleanup();
     if (abortController.signal.aborted) return;
 
     const msg = getErrorMessage(err);
-    console.error(`[PROXY] Request failed after ${Date.now() - reqStart}ms: ${msg}`);
-
-    // A 401 here means OUR NIM key was rejected; don't make the client think its own key is wrong.
-    let status = err.response?.status || (err.timedOut ? 504 : 500);
-    if (status === 401) status = 502;
+    console.error(`[PROXY] Request failed: ${msg}`);
 
     if (!res.headersSent) {
-      res.status(status).json({ error: { message: msg, type: 'invalid_request_error', code: status } });
+      res.status(err.response?.status || (err.timedOut ? 504 : 500)).json({
+        error: { message: msg, type: 'invalid_request_error', code: err.response?.status || 500 }
+      });
     } else {
-      finished = true;
       finishStreamWithNotice(res, `\n\n[Proxy Error: ${msg}]`);
     }
   }
 });
 
-// JSON parse errors etc.
-app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
-  const status = err.status || err.statusCode || 400;
-  res.status(status).json({ error: { message: err.message || 'Bad request', type: 'invalid_request_error', code: status } });
-});
-
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`[PROXY] Server running on port ${PORT}`);
   if (!SKIP_VALIDATION) {
-    nim.get('/models', { headers: { Authorization: `Bearer ${NIM_API_KEY}` }, timeout: 15000 })
-      .then(r => console.log(`[VALIDATION] Connected to NIM. Catalog size: ${r.data.data?.length || 0}`))
+    nim.get('/models', { headers: { Authorization: `Bearer ${NIM_API_KEY}` } })
+      .then(r => console.log(`[VALIDATION] Successfully connected to NIM. Catalog size: ${r.data.data?.length || 0}`))
       .catch(e => console.warn(`[VALIDATION] Failed to reach NIM: ${e.message}`));
   }
 });
-// Longer than most platform load balancers' idle timeout, avoids random 502s on reused connections
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
