@@ -1,4 +1,4 @@
-// server.js — Clean OpenAI-compatible proxy for NVIDIA NIM (Testing Mode)
+// server.js — Clean OpenAI-compatible proxy for NVIDIA NIM (with Test Page)
 
 const express = require('express');
 const cors = require('cors');
@@ -47,12 +47,13 @@ const MODEL_MAPPING = {
   'glm-5.3': 'z-ai/glm-5.3',
   'deepseek': 'deepseek-ai/deepseek-v4.1-flash',
   'deepseek-flash': 'deepseek-ai/deepseek-v4-flash-0731',
-  'llama-3.1-8b': 'meta/llama-3.1-8b-instruct',
+  // Replaced deprecated llama-3.1-8b with a fast, active model
+  'llama-3.1-8b': 'nvidia/nemotron-3.5-lightning-30b-a3b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'm3': 'minimaxai/minimax-m3'
 };
 
-const DEFAULT_MODEL = 'meta/llama-3.1-8b-instruct';
+const DEFAULT_MODEL = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 
 // FALLBACKS REMOVED FOR TESTING
 const FALLBACK_MODELS = [];
@@ -74,7 +75,7 @@ function safeTimingEqual(a, b) {
 }
 
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/' || req.path === '/v1/models') return next();
+  if (req.path === '/health' || req.path === '/' || req.path === '/v1/models' || req.path === '/test-glm') return next();
   const token = req.headers.authorization?.replace('Bearer ', '').trim();
   if (!token || !CLIENT_AUTH_KEY || !safeTimingEqual(token, CLIENT_AUTH_KEY)) {
     return res.status(403).json({ error: { message: 'Forbidden', type: 'authentication_error', code: 403 } });
@@ -132,6 +133,77 @@ app.get('/', (req, res) => res.send('Proxy is running.'));
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/v1/models', (req, res) => {
   res.json({ object: 'list', data: Object.keys(MODEL_MAPPING).map(id => ({ id, object: 'model', owned_by: 'nim-proxy' })) });
+});
+
+// ─── Test GLM Page ───
+app.get('/test-glm', (req, res) => {
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <title>GLM-5.3-Flash Diagnostics</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+    input, button, textarea { font-size: 1rem; padding: 0.5rem; margin: 0.25rem 0; width: 100%; box-sizing: border-box; }
+    #output { background: #f4f4f4; padding: 1rem; border-radius: 4px; white-space: pre-wrap; font-family: monospace; min-height: 100px; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>GLM-5.3-Flash Diagnostics</h1>
+  <p>This page sends a minimal, non-streaming request to <code>z-ai/glm-5.3-flash</code> with <code>max_tokens: 1</code> to force an immediate error or response.</p>
+  
+  <label>NIM API Key:</label>
+  <input type="password" id="apiKey" placeholder="nvapi-..." />
+  
+  <label>Model ID:</label>
+  <input type="text" id="model" value="z-ai/glm-5.3-flash" />
+  
+  <button onclick="runTest()">Run Test</button>
+  
+  <h3>Output:</h3>
+  <pre id="output">Waiting for test...</pre>
+
+  <script>
+    async function runTest() {
+      const out = document.getElementById('output');
+      const apiKey = document.getElementById('apiKey').value.trim();
+      const model = document.getElementById('model').value.trim();
+
+      if (!apiKey) {
+        out.textContent = 'Please paste your NIM API key (nvapi-...) first.';
+        return;
+      }
+
+      out.textContent = 'Sending minimal request...';
+
+      try {
+        const start = Date.now();
+        const res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + apiKey,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: model,
+            messages: [{ role: 'user', content: 'hi' }],
+            max_tokens: 1,
+            stream: false
+          })
+        });
+
+        const duration = Date.now() - start;
+        const text = await res.text();
+        
+        out.textContent = \`HTTP Status: \${res.status} \${res.statusText}\nDuration: \${duration}ms\n\nRaw Response:\n\${text}\`;
+      } catch (err) {
+        out.textContent = 'Fetch failed: ' + err.message;
+      }
+    }
+  </script>
+</body>
+</html>
+  `);
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
