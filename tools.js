@@ -1,89 +1,106 @@
-// tools.js — Recovery for leaked <tool_call> tags in content
+// tools.js — recovery of <tool_call>…</tool_call> blocks that leak into message content
+
+'use strict';
+
+const { partialLen } = require('./utils');
 
 const OPEN = '<tool_call>';
 const CLOSE = '</tool_call>';
 
-function genId() {
-  return `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+const genId = () => `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+
+/** Parses the JSON inside a tool_call block. Returns a `function` object, or null if invalid. */
+function parseToolCall(inner) {
+  try {
+    const parsed = JSON.parse(inner);
+    if (parsed && typeof parsed.name === 'string') {
+      const args = parsed.arguments ?? {};
+      return { name: parsed.name, arguments: typeof args === 'string' ? args : JSON.stringify(args) };
+    }
+  } catch { /* not JSON — leave the text untouched */ }
+  return null;
 }
 
+/** Non-stream: pulls leaked tool calls out of `content`. */
 function extractLeakedToolCalls(content) {
   if (!content || !content.includes(OPEN)) return { content, toolCalls: [] };
+
   const toolCalls = [];
-  let result = '', cursor = 0;
+  let result = '';
+  let cursor = 0;
 
-  while (true) {
-    const openIdx = content.indexOf(OPEN, cursor);
-    if (openIdx === -1) { result += content.slice(cursor); break; }
-    const closeIdx = content.indexOf(CLOSE, openIdx);
-    if (closeIdx === -1) { result += content.slice(cursor); break; }
-
-    result += content.slice(cursor, openIdx);
-    const inner = content.slice(openIdx + OPEN.length, closeIdx).trim();
-
-    try {
-      const parsed = JSON.parse(inner);
-      if (parsed && typeof parsed.name === 'string') {
-        toolCalls.push({
-          id: genId(), type: 'function',
-          function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments ?? {}) }
-        });
-      } else { result += content.slice(openIdx, closeIdx + CLOSE.length); }
-    } catch {
-      result += content.slice(openIdx, closeIdx + CLOSE.length);
+  for (;;) {
+    const open = content.indexOf(OPEN, cursor);
+    const close = open === -1 ? -1 : content.indexOf(CLOSE, open);
+    if (open === -1 || close === -1) {
+      result += content.slice(cursor);
+      break;
     }
-    cursor = closeIdx + CLOSE.length;
+
+    result += content.slice(cursor, open);
+    const fn = parseToolCall(content.slice(open + OPEN.length, close).trim());
+    if (fn) toolCalls.push({ id: genId(), type: 'function', function: fn });
+    else result += content.slice(open, close + CLOSE.length);
+
+    cursor = close + CLOSE.length;
   }
+
   return { content: result, toolCalls };
 }
 
-function partialLen(str, tag) {
-  const max = Math.min(str.length, tag.length - 1);
-  for (let i = max; i > 0; i--) {
-    if (tag.startsWith(str.slice(str.length - i))) return i;
-  }
-  return 0;
-}
-
+/** Streaming: strips leaked tool calls from content chunks and emits them as tool_call deltas. */
 class ToolCallStreamRecovery {
-  constructor() { this.buf = ''; this.idx = 0; }
+  constructor() {
+    this.buf = '';
+    this.idx = 0;
+  }
+
+  /** Make sure recovered tool calls don't reuse indexes the model already used natively. */
+  reserve(nextIndex) {
+    this.idx = Math.max(this.idx, nextIndex);
+  }
+
   process(text) {
     this.buf += text;
     const deltas = [];
-    let out = '', cursor = 0;
+    let out = '';
+    let cursor = 0;
 
-    while (true) {
-      const o = this.buf.indexOf(OPEN, cursor);
-      if (o === -1) {
-        const rem = this.buf.slice(cursor);
-        const p = partialLen(rem, OPEN);
-        out += rem.slice(0, rem.length - p);
-        this.buf = rem.slice(rem.length - p);
+    for (;;) {
+      const open = this.buf.indexOf(OPEN, cursor);
+
+      if (open === -1) {
+        const rest = this.buf.slice(cursor);
+        const keep = partialLen(rest, OPEN);
+        out += rest.slice(0, rest.length - keep);
+        this.buf = rest.slice(rest.length - keep);
         break;
       }
-      const c = this.buf.indexOf(CLOSE, o);
-      if (c === -1) {
-        out += this.buf.slice(cursor, o);
-        this.buf = this.buf.slice(o);
+
+      const close = this.buf.indexOf(CLOSE, open);
+      if (close === -1) {
+        out += this.buf.slice(cursor, open);
+        this.buf = this.buf.slice(open);
         break;
       }
-      out += this.buf.slice(cursor, o);
-      const inner = this.buf.slice(o + OPEN.length, c).trim();
 
-      try {
-        const parsed = JSON.parse(inner);
-        if (parsed && typeof parsed.name === 'string') {
-          deltas.push({
-            index: this.idx++, id: genId(), type: 'function',
-            function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments ?? {}) }
-          });
-        } else { out += this.buf.slice(o, c + CLOSE.length); }
-      } catch { out += this.buf.slice(o, c + CLOSE.length); }
-      cursor = c + CLOSE.length;
+      out += this.buf.slice(cursor, open);
+      const fn = parseToolCall(this.buf.slice(open + OPEN.length, close).trim());
+      if (fn) deltas.push({ index: this.idx++, id: genId(), type: 'function', function: fn });
+      else out += this.buf.slice(open, close + CLOSE.length);
+
+      cursor = close + CLOSE.length;
     }
+
     return { content: out, toolCallDeltas: deltas };
   }
-  flush() { const left = this.buf; this.buf = ''; return left; }
+
+  /** Returns any text still held back (an unterminated tag) and resets the buffer. */
+  flush() {
+    const left = this.buf;
+    this.buf = '';
+    return left;
+  }
 }
 
 module.exports = { extractLeakedToolCalls, ToolCallStreamRecovery };

@@ -1,159 +1,178 @@
-// reasoning.js — NIM-specific reasoning payload translation
+// reasoning.js — NIM-specific reasoning payloads and reasoning-stream normalization
 
-const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
-if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
+'use strict';
 
-const REASONING_EFFORT_ENUMS = {
+const { log } = require('./config');
+const { partialLen } = require('./utils');
+
+const MINIMAX = 'minimaxai/minimax-m3';
+
+// Valid `reasoning_effort` values per model. Models not listed accept any value.
+const EFFORT_ENUMS = {
   'openai/gpt-oss-120b': ['low', 'medium', 'high'],
   'openai/gpt-oss-20b': ['low', 'medium', 'high'],
-  'deepseek-ai/deepseek-v4.1-flash': ['low', 'high', 'max'],
-  'deepseek-ai/deepseek-v4-flash-0731': ['low', 'high', 'max'],
   'nvidia/nemotron-3-ultra-550b-a55b': ['none', 'medium', 'high'],
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
-  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
+  'moonshotai/kimi-k3.1-pro': ['low', 'high', 'max'],
+  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max'],
 };
 
-function resolveEffectiveThinking(enableThinking, clientReasoningEffort) {
-  if (clientReasoningEffort === 'off' || clientReasoningEffort === 'none') return false;
-  if (clientReasoningEffort === 'on') return true;
+// Models that take a plain top-level `reasoning_effort`.
+const OPENAI_STYLE = new Set([
+  'openai/gpt-oss-120b',
+  'openai/gpt-oss-20b',
+  'moonshotai/kimi-k3',
+  'moonshotai/kimi-k3.1-pro',
+  'meta/muse-glimmer-30b',
+]);
+
+/** Client `reasoning_effort` → validated effort string (or undefined). */
+function pickEffort(model, clientEffort) {
+  if (typeof clientEffort !== 'string' || !clientEffort) return undefined;
+  if (clientEffort === 'on' || clientEffort === 'off') return undefined;
+
+  const allowed = EFFORT_ENUMS[model];
+  if (allowed && !allowed.includes(clientEffort)) {
+    log.warn(`[REASONING] Dropping invalid effort "${clientEffort}" for ${model}`);
+    return undefined;
+  }
+  return clientEffort;
+}
+
+function isThinkingOn(enableThinking, clientEffort) {
+  if (clientEffort === 'off' || clientEffort === 'none') return false;
+  if (clientEffort === 'on') return true;
   return enableThinking;
 }
 
-function getReasoningPayload(model, enableThinking, clientReasoningEffort) {
-  const thinkingOn = resolveEffectiveThinking(enableThinking, clientReasoningEffort);
-  
-  const rawEffort = (clientReasoningEffort === 'off' || clientReasoningEffort === 'on') 
-    ? undefined : clientReasoningEffort;
-  
-  let effort = rawEffort;
-  const allowed = REASONING_EFFORT_ENUMS[model];
-  if (allowed && effort && !allowed.includes(effort)) {
-    console.warn(`[REASONING] Dropping invalid effort "${effort}" for ${model}`);
-    effort = undefined;
+/** Builds the model-specific request fields that switch reasoning on/off. */
+function getReasoningPayload(model, enableThinking, clientEffort) {
+  const thinkingOn = isThinkingOn(enableThinking, clientEffort);
+  const effort = pickEffort(model, clientEffort);
+
+  if (OPENAI_STYLE.has(model)) {
+    if (effort) return { reasoning_effort: effort };
+    return thinkingOn ? { reasoning_effort: 'high' } : {};
   }
 
   switch (model) {
-    // ─── DeepSeek ───
-    case 'deepseek-ai/deepseek-v4.1-flash':
-    case 'deepseek-ai/deepseek-v4-flash-0731': {
-      const wantsThinking = clientReasoningEffort === 'on' || !!rawEffort || thinkingOn;
-      if (!wantsThinking) return { chat_template_kwargs: { thinking: false } };
-      return { 
-        chat_template_kwargs: { thinking: true, reasoning_effort: effort || 'high' } 
-      };
-    }
-
-    // ─── GLM 5.3 (CRITICAL FIX: Send NOTHING to match Playground) ───
+    // GLM: send nothing (matches the NVIDIA Playground).
     case 'z-ai/glm-5.3':
-    case 'z-ai/glm-5.3-flash': {
+    case 'z-ai/glm-5.3-flash':
       return {};
-    }
 
-    // ─── Nemotron 3 Ultra ───
     case 'nvidia/nemotron-3-ultra-550b-a55b': {
-      if (!thinkingOn) return { reasoning_effort: 'none' };
+      const on = thinkingOn || (effort && effort !== 'none');
+      if (!on) return { reasoning_effort: 'none' };
       return { reasoning_effort: effort || 'high', reasoning_budget: 16384 };
     }
 
-    // ─── Nemotron 3 Super ───
-    case 'nvidia/nemotron-3-super-120b-a12b': {
-      if (!thinkingOn) return {};
-      return { chat_template_kwargs: { enable_thinking: true } };
-    }
+    case 'nvidia/nemotron-3-super-120b-a12b':
+      return thinkingOn ? { chat_template_kwargs: { enable_thinking: true } } : {};
 
-    // ─── Standard OpenAI-style reasoning_effort ───
-    case 'openai/gpt-oss-120b':
-    case 'openai/gpt-oss-20b':
-    case 'moonshotai/kimi-k3': {
-      if (effort) return { reasoning_effort: effort };
-      if (thinkingOn) return { reasoning_effort: 'high' };
-      return {};
-    }
-
-    // ─── MiniMax ───
-    case 'minimaxai/minimax-m3': {
+    case MINIMAX:
       return { chat_template_kwargs: { thinking_mode: thinkingOn ? 'enabled' : 'disabled' } };
-    }
 
     default:
-      if (thinkingOn) return { chat_template_kwargs: { enable_thinking: true } };
-      return {};
+      return thinkingOn ? { chat_template_kwargs: { enable_thinking: true } } : {};
   }
 }
 
-// ─── Stream Normalizer ───
+// ─── Stream normalization ───
+
+/** Splits a text stream into content / reasoning around open/close delimiters. */
 class DelimiterParser {
-  constructor(open, close) { this.open = open; this.close = close; this.in = false; this.buf = ''; }
+  constructor(open, close) {
+    this.open = open;
+    this.close = close;
+    this.inside = false;
+    this.buf = '';
+  }
+
   process(chunk) {
     this.buf += chunk;
-    let content = '', reasoning = '';
-    while (true) {
-      const target = this.in ? this.close : this.open;
-      const idx = this.buf.indexOf(target);
+    let content = '';
+    let reasoning = '';
+    const emit = (text) => { if (this.inside) reasoning += text; else content += text; };
+
+    for (;;) {
+      const tag = this.inside ? this.close : this.open;
+      const idx = this.buf.indexOf(tag);
+
       if (idx !== -1) {
-        const text = this.buf.substring(0, idx);
-        if (this.in) reasoning += text; else content += text;
-        this.in = !this.in;
-        this.buf = this.buf.substring(idx + target.length);
-      } else {
-        let part = 0;
-        const max = Math.min(this.buf.length, target.length - 1);
-        for (let i = max; i > 0; i--) {
-          if (target.startsWith(this.buf.substring(this.buf.length - i))) { part = i; break; }
-        }
-        const text = this.buf.substring(0, this.buf.length - part);
-        if (this.in) reasoning += text; else content += text;
-        this.buf = this.buf.substring(this.buf.length - part);
-        break;
+        emit(this.buf.slice(0, idx));
+        this.inside = !this.inside;
+        this.buf = this.buf.slice(idx + tag.length);
+        continue;
       }
+
+      // Hold back a possible partial tag at the end of the buffer.
+      const keep = partialLen(this.buf, tag);
+      emit(this.buf.slice(0, this.buf.length - keep));
+      this.buf = this.buf.slice(this.buf.length - keep);
+      return { content, reasoning };
     }
-    return { content, reasoning };
   }
+
   flush() {
-    let out = { content: '', reasoning: '' };
-    if (this.buf) { if (this.in) out.reasoning = this.buf; else out.content = this.buf; this.buf = ''; }
+    const out = { content: '', reasoning: '' };
+    if (this.buf) {
+      if (this.inside) out.reasoning = this.buf; else out.content = this.buf;
+      this.buf = '';
+    }
     return out;
   }
 }
 
+const newMiniMaxParser = () => new DelimiterParser('<mm:think>', '</mm:think>');
+
+/** Normalizes streamed deltas so reasoning always lives in `delta.reasoning`. */
 class StreamNormalizer {
   constructor(model) {
-    this.parser = model === 'minimaxai/minimax-m3' ? new DelimiterParser('<mm:think>', '</mm:think>') : null;
+    this.parser = model === MINIMAX ? newMiniMaxParser() : null;
   }
+
   processDelta(delta) {
     const out = { ...delta };
-    let r = out.reasoning || out.reasoning_content || '';
-    let c = out.content || '';
-    if (!r && c && this.parser) {
-      const parsed = this.parser.process(c);
-      r = parsed.reasoning; c = parsed.content;
+    let reasoning = out.reasoning || out.reasoning_content || '';
+    let content = out.content || '';
+
+    if (!reasoning && content && this.parser) {
+      ({ content, reasoning } = this.parser.process(content));
     }
-    if (c) out.content = c; else delete out.content;
-    if (r) out.reasoning = r; else delete out.reasoning;
+
+    if (content) out.content = content; else delete out.content;
+    if (reasoning) out.reasoning = reasoning; else delete out.reasoning;
     delete out.reasoning_content;
     return out;
   }
-  flush() { return this.parser ? this.parser.flush() : { content: '', reasoning: '' }; }
+
+  flush() {
+    return this.parser ? this.parser.flush() : { content: '', reasoning: '' };
+  }
 }
 
+/** Non-stream equivalent: moves inline reasoning into `message.reasoning`. */
 function normalizeNonStreamChoice(choice, model) {
   if (!choice) return choice;
+
   const msg = choice.message || {};
-  let r = msg.reasoning || msg.reasoning_content || '';
-  let c = msg.content || '';
-  if (!r && c && model === 'minimaxai/minimax-m3') {
-    const p = new DelimiterParser('<mm:think>', '</mm:think>');
-    const parsed = p.process(c);
-    const flushed = p.flush();
-    c = (parsed.content || '') + (flushed.content || '');
-    r = (parsed.reasoning || '') + (flushed.reasoning || '');
+  let reasoning = msg.reasoning || msg.reasoning_content || '';
+  let content = msg.content || '';
+
+  if (!reasoning && content && model === MINIMAX) {
+    const parser = newMiniMaxParser();
+    const parsed = parser.process(content);
+    const rest = parser.flush();
+    content = parsed.content + rest.content;
+    reasoning = parsed.reasoning + rest.reasoning;
   }
-  const newMsg = { ...msg };
-  if (c) newMsg.content = c; else newMsg.content = null;
-  if (r) newMsg.reasoning = r;
-  delete newMsg.reasoning_content;
-  return { ...choice, message: newMsg };
+
+  const message = { ...msg, content: content || null };
+  if (reasoning) message.reasoning = reasoning;
+  delete message.reasoning_content;
+  return { ...choice, message };
 }
 
-module.exports = { SHOW_REASONING, getReasoningPayload, StreamNormalizer, normalizeNonStreamChoice };
+module.exports = { getReasoningPayload, StreamNormalizer, normalizeNonStreamChoice };
