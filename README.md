@@ -1,151 +1,175 @@
-### Announcement 
-Due to personal health reasons, Jontte (original owner) will no longer be able to maintain this project. I'll try to maintain this for the time being!
+# NIM → OpenAI Proxy
 
-### If you forked before June 7, 2026, please pull the latest version — previous versions had an auth bypass and startup DDoS vulnerability.
+A small, self-hosted translation layer that exposes **NVIDIA NIM** models through an **OpenAI-compatible API**. Point JanitorAI, SillyTavern (with Lorebary), or any other OpenAI-style client at it and use NIM models without changing the client.
 
-### Reasoning officially works! Every model (that supports reasoning) works. To use reasoning, use the [optional environmental variables](#optional-environment-variables) section!
+> **Maintenance notice:** The original author, Jontte, can no longer maintain this project. It is now maintained by a community member on a best-effort basis.
+>
+> **Security notice:** If you forked before **June 7, 2026**, pull the latest version. Older versions had an auth bypass and a startup DDoS vulnerability.
 
-# If you get the error 'Forbidden: Invalid or missing authentication', please attempt regenerating your API key, I’m still not sure as to what is causing this, but regenerating API key seems to work. (for me)
+## Features
 
+- OpenAI-compatible `/v1/chat/completions` (streaming and non-streaming) and `/v1/models`
+- Friendly aliases (`gpt-4`, `kimi-k3.1-pro`, …) mapped to NIM models, plus raw `vendor/model` IDs
+- Reasoning support: effort levels, on/off switching, and optional `<thinking>` output
+- Recovery of tool calls that models leak into message text as `<tool_call>…</tool_call>`
+- Bearer-token auth so your NVIDIA key never reaches the client
+- SSE heartbeats so slow "thinking" models don't hit proxy or platform timeouts
+- Clean stream termination (always ends with `[DONE]`), even if the upstream drops
 
-### NVIDIA NIM to OpenAI Proxy
-Hello, this is my first ever project on Github that I am making public. This is essentially just a translation layer between the API format that NVIDIA NIM uses to the format OpenAI uses. Jontte made this originally by building on a script from a Reddit guide. Over the time of a month he iterated on it, fixed problems, added auth, more models, and removed/replaced deprecated models.
-These are the current available models for usage, and the use cases for all of them. 
+## Quick start
 
-### Why use this proxy?
+**Requirements:** Node.js 20+ and an NVIDIA API key from [build.nvidia.com](https://build.nvidia.com/) (profile icon → *API keys*).
 
-Many frontends such as JanitorAI requires an OpenAI-compatible proxy to use NVIDIA NIM. SillyTavern can connect to NIM directly, but if you use **Lorebary** for prompts, lorebooks, or plugins, this proxy is necessary — Lorebary does not support NIM natively. Various other frontends that aren’t even related to RP may also not work with NIM.
+```bash
+git clone <your-fork-url>
+cd nim-openai-proxy
+npm install
 
-### Legality
+export NIM_API_KEY="nvapi-..."
+export CLIENT_AUTH_KEY="$(openssl rand -hex 24)"   # this is the "API key" your client will use
+npm start
+```
 
-Yes, it's legal. It's just HTTP requests routed through your own proxy. You still need a valid NVIDIA API key and are subject to their rate limits. This is no different from using any other API gateway or reverse proxy.
+Test it:
 
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer $CLIENT_AUTH_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello!"}]}'
+```
 
-### Requirements
+For local development, `.env.example` lists every variable. Load it with your shell or `node --env-file=.env server.js`.
 
-Node.js 24+, a NVAPI/Nim API key, a deployment platform (though if you follow the guide below none of those should be a problem).
+## Deploying
 
-### Model Mapping
+Any host that runs Node works (Railway, Render, Fly.io, a VPS). Railway is the simplest:
 
-| Alias | Backend Model | Best For | Speed | Filters |
+1. **Fork this repo first**, then deploy your fork. This keeps your deployment private to you.
+2. Wait for the first build to finish, then open the **Variables** tab and set `NIM_API_KEY` and `CLIENT_AUTH_KEY`.
+3. In **Settings → Networking**, generate a public URL.
+4. In your client, set the proxy URL to `https://<your-url>/v1/chat/completions`, the API key to your `CLIENT_AUTH_KEY`, and the model to an alias from the table below.
+
+Environment variable changes require a restart or redeploy to take effect.
+
+## Authentication
+
+Clients authenticate with `Authorization: Bearer <CLIENT_AUTH_KEY>`. Use a long random string (32+ characters):
+
+```bash
+openssl rand -hex 24
+```
+
+This is deliberately separate from `NIM_API_KEY`: the client only ever holds the proxy key, and you can rotate it without touching your NVIDIA key. `/`, `/health`, and `/v1/models` are public so clients can check connectivity before auth is configured. If `CLIENT_AUTH_KEY` is unset, every protected route is rejected.
+
+## Models
+
+Any alias below works, and so does any raw NIM ID such as `meta/muse-glimmer-30b`. Unknown names fall back to `nvidia/nemotron-3.5-lightning-30b-a3b`.
+
+| Alias | NIM model | Best for | Speed | Filters |
 |---|---|---|---|---|
-| `gpt-4-turbo` | `moonshotai/kimi-k3` | Deep, immersive RP & coding | Slow| Medium-High |
 | `gpt-4` | `nvidia/nemotron-3-ultra-550b-a55b` | Immersive RP | Fast | Low |
-| `gpt-4-flash` | `deepseek-ai/deepseek-v4-flash-0731` | Fast, non-edgy RP | Fast | High |
-| `gpt-4o` | `deepseek-ai/deepseek-v4-pro-0813` | Coding | Slow | High |
-| `gpt-3.5o` | `nvidia/nemotron-3.5-lightning-30b-a3b` | General chat, fast lightweight tasks | Very Fast | Low-Medium |
-| `gemini-pro` | `nvidia/llama-3.1-nemotron-70b-instruct` | Daily driver, low latency | Fast | Low |
-| `gemini-turbo` | `nvidia/llama3-chatqa-1.5-70b` | Fast general purpose | Fast | Low-Medium |
-| `mistral` | `mistralai/mistral-large-2-instruct` | Best quality, unfiltered | Slow | Low |
-| `mistral-turbo` | `nv-mistralai/mistral-nemo-12b-instruct` | Fast fallback | Very Fast | Low |
-| `mistral-pro` | `mistralai/mistral-7b-instruct-v0.3` | Lightweight scenes | Very Fast | Low |
-| `mistral-fast` | `nvidia/mistral-nemo-minitron-8b-8k-instruct` | Fast, compact Mistral | Very Fast | Low |
-| `mistral-nemo` | `mistralai/mistral-nemotron` | Casual/anime RP | Fast | Low |
-| `claude-3-opus` | `google/diffusiongemma-26b-a4b-it` | Alternative to Chinese models | Extremely fast | Low-Medium |
-| `claude-3-sonnet` | `openai/gpt-oss-20b` | Fast, distinct voice | Fast | Low-Medium |
 | `gpt-3.5-turbo` | `nvidia/nemotron-3-super-120b-a12b` | Lightweight tasks | Fast | Low |
-| `gpt-3.5` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` | Nvidia nano fallback | Fast | Low |
-| `google-light` | `google/gemma-4-31b-it` | Short scenes, fast | Fast | Low-Medium |
-| `google-lighter` | `poolside/laguna-xs-2.1` | Coding | Fast | Unknown (to me) |
-| `google-lightest` | `meta/muse-glimmer-30b` | Coding & Agentic work | Fast | Unknown (to me) |
-| `m3` | `minimaxai/minimax-m3` | Experimental | Medium-High | Unknown (to me) |
-| `llama-vision` | `meta/llama-3.2-11b-vision-instruct` | Vision/Multimodal tasks | Fast | Low |
-| `vision` | `meta/llama-3.2-11b-vision-instruct` | Vision/Multimodal (short alias) | Fast | Low |
-| `llama-vision-11b` | `meta/llama-3.2-11b-vision-instruct` | Vision/Multimodal 11B | Fast | Low |
-| `llama-3.2-vision` | `meta/llama-3.2-11b-vision-instruct` | Vision/Multimodal full name | Fast | Low |
+| `nemotron-lightning` (legacy: `llama-3.1-8b`) | `nvidia/nemotron-3.5-lightning-30b-a3b` | General chat, quick tasks | Very fast | Low–Medium |
+| `kimi-k3` | `moonshotai/kimi-k3` | Deep RP and coding | Slow | Medium–High |
+| `kimi-k3.1-pro` | `moonshotai/kimi-k3.1-pro` | Agentic coding, 1M-token context | — | — |
+| `glm-5.3` | `z-ai/glm-5.3` | General use | — | — |
+| `glm-flash`, `gpt-4-flash` | `z-ai/glm-5.3-flash` | Fast general use | — | — |
+| `claude-3-sonnet` | `openai/gpt-oss-20b` | Fast, distinct voice | Fast | Low–Medium |
+| `m3` | `minimaxai/minimax-m3` | Experimental | Medium–High | — |
 
-### Filter Guide
+Speed and filter ratings are the maintainer's subjective notes, not benchmarks. "—" means untested.
 
-| If your use-case involves... | Avoid | Use instead |
+> **`kimi-k3.1-pro` is preview-only on NVIDIA's side.** At the time of writing, the model page says it is published for playground use and that no API key authorizes programmatic access yet. Requests will fail until NVIDIA opens the endpoint. The alias is ready for when they do.
+
+DeepSeek models are intentionally blocked, whether requested by alias or raw ID (`400 Model not available`).
+
+To add or change an alias, edit `MODEL_MAPPING` in `models.js`. If the model has special reasoning parameters, add a case in `reasoning.js`.
+
+## Reasoning
+
+Reasoning is controlled by environment variables and per-request fields.
+
+| Setting | Where | Effect |
 |---|---|---|
-| Dark themes, violence, mature content | `gpt-4-flash`, `gpt-4-turbo` (They have high filters due to being based in China) | `mistral`, `gemini-pro`, `claude-3-opus` |
-| Fast responses needed | `gpt-4o`, `gpt-4-turbo` | `gemini-pro`, `mistral-turbo`, `gpt-3.5o` |
-| Long context / memory | Anything under 30B | `gpt-4-turbo`, `mistral`, `gpt-4` |
-| Testing / very fast replies | — | `google-lightest`, `gpt-3.5o` |
-| Coding / Long horizon work | — | `gpt-4-turbo`, `gpt-4o` |
+| `ENABLE_THINKING_MODE=true` | env | Turns reasoning on by default for models that support it |
+| `SHOW_REASONING=true` | env | Returns reasoning to the client (`reasoning` and `reasoning_content` fields) |
+| `reasoning_effort` | request body | `"off"`/`"none"` disables, `"on"` enables, or a model-specific level |
+| `x-reasoning-format: inline` | request header | Streams reasoning inside the content as `<thinking>…</thinking>` (needs `SHOW_REASONING=true`) |
 
-### Fallback Chain
+Supported effort levels per model (invalid values are dropped with a warning):
 
-If your requested model fails, the proxy automatically tries:
-1. Requested model
-2. `google/gemma-4-31b-it`
-3. `google/diffusiongemma-26b-a4b-it`
-4. `mistralai/mistral-nemotron`
-5. `nvidia/nemotron-3-super-120b-a12b`
+| Model | Levels |
+|---|---|
+| `openai/gpt-oss-*` | `low`, `medium`, `high` |
+| `nvidia/nemotron-3-ultra-550b-a55b` | `none`, `medium`, `high` |
+| `moonshotai/kimi-k3`, `moonshotai/kimi-k3.1-pro` | `low`, `high`, `max` |
+| `meta/muse-glimmer-30b` | `none`, `minimal`, `low`, `medium`, `high`, `max` |
+| `minimaxai/minimax-m3` | on/off only |
+| GLM 5.3 | no parameters are sent |
 
-All fallbacks are non-Chinese-hosted to avoid filter interruption mid-scene. These can be changed, but i found that these four work best as fallbacks.
+## Configuration
 
-### Auth Guide
-I added auth middleware that wasn't present in the code I built upon. It uses an env var in your deployment. Use any secure string of 32+ characters, or generate one by hashing your NVAPI key. I recommend using an online hash tool or command to make a hash of your NVAPI key since the key is already complex as is, and a hash makes it more secure as it cannot be realistically reversed back to the NVAPI key. The first 32 characters of the hash are enough.
-You can easily generate the hash with an online SHA-256 generator or any hash tool. Then make an env variable called "CLIENT_AUTH_KEY" and enter the first 32 characters of your hash into the variable (or any custom length over 16, or a custom key). Enter the hash into the API Key field in JanitorAI/SillyTavern.
-
-### Proxy Setup Guide
-
-Firstly head to https://build.nvidia.com/ and login/create an account. Then click your profile icon and navigate to "API keys". There you can generate an API key, and label it whatever you want. Save it immediately — you'll need to regenerate it if lost.
-
-You *can* use basically any service that allows cloud deployments/VMs with a static IP, but I recommend Railway, Render, Vercel (which I personally use!).
-and possibly Oracle if you are comfortable with SSH and value the freedom it gives, but Railway is the easiest to setup.
-You need to login to Railway with your Github. **Fork the repo before deploying. I cannot see your env vars, but forking ensures your deployment is fully isolated!** This prevents me (or anyone) from seeing your deployment in Railway's dashboard or through github. I also recommend making sure deployments aren't visible on the frontpage.
-After you have made a deployment, you need to wait around 3 minutes for it to finish deploying. Then go into the "variables" tab, and create an env var with the name "NIM_API_KEY", and enter your NVAPI key into the variable. Next in your deployment go to the settings page, and there the networking section. Generate a public URL for your deployment. This is necessary to access it. Now your proxy is ready.
-
-### Important Information
-You can check the status of your proxy with the "/health" endpoint, and a list of models with "/v1/models". These endpoints intentionally do not require the auth, so clients can verify connectivity before configuring auth.
-Your actual chat endpoint is in "/v1/chat/completions", and is the one you use in Janitor AI/SillyTavern or whatever platform you use.
-The client never sees your NVAPI key, which is why we don't use it as the auth, since the whole point of the auth configuration is so that your NVAPI key is not stored on your client.
-
-### Optional Environment Variables
-
-After deploying, you can set these in Railway's **Variables** tab (reasoning does not reliably work):
-
-| Variable | Value | Effect |
+| Variable | Default | Description |
 |---|---|---|
-| `SHOW_REASONING` | `true` | Shows model reasoning in `<thinking>` tags |
-| `ENABLE_THINKING_MODE` | `true` | Sends thinking parameters to supported models |
-| `DISCORD_WEBHOOK_URL` | Webhook URL | Alerts you when models fail validation |
-| `SKIP_VALIDATION` | `true` | Disables startup model checks |
-| `DEBUG_MODE` | `true` | Allows you to debug everything going on. |
+| `NIM_API_KEY` | — | **Required.** Your NVIDIA API key |
+| `CLIENT_AUTH_KEY` | — | **Required.** Bearer token clients must send |
+| `PORT` | `3000` | Port to listen on |
+| `NIM_API_BASE` | `https://integrate.api.nvidia.com/v1` | Upstream base URL |
+| `ENABLE_THINKING_MODE` | `false` | Enable reasoning by default |
+| `SHOW_REASONING` | `false` | Return reasoning to clients |
+| `DEFAULT_MAX_TOKENS` | `4096` | Used when the client sends no `max_tokens` (hard cap: 65536) |
+| `REQUEST_TIMEOUT_MS` | `120000` | Max wait for NIM to start responding |
+| `THINKING_DEADLINE_MS` | `120000` | Abort a stream that produces no output at all within this time |
+| `SKIP_VALIDATION` | `false` | Skip the startup connectivity check |
+| `DEBUG_MODE` | `false` | Verbose logs (heartbeats, progress, skipped chunks) |
+| `KEEP_STREAM_USAGE` | `false` | Keep `stream_options` on requests without tools |
 
-Set to `false` or remove to disable. Changes apply without redeploying.
+## Endpoints
 
-### Troubleshooting
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/` | No | Liveness text |
+| `GET` | `/health` | No | `{"status":"ok"}` |
+| `GET` | `/v1/models` | No | List of aliases |
+| `POST` | `/v1/chat/completions` | Yes | Chat completions (set `"stream": true` for SSE) |
 
-| Problem | Likely Cause | Fix |
+## Troubleshooting
+
+| Problem | Likely cause | Fix |
 |---|---|---|
-| "All models failed" error | NIM API key invalid or expired | Regenerate key at build.nvidia.com |
-| Very slow responses | Using `gpt-4o`, `gpt-4-turbo`, or other Chinese-hosted models during peak hours | Switch to `gemini-pro`, `mistral-turbo`, `claude-3-opus`, or `gpt-3.5o` |
-| Filter interrupts RP | Using Chinese-hosted model for mature content | Use `mistral`, `gemini-pro`, or `claude-3-opus` |
-| 404 on `/v1/chat/completions` | Auth mismatch | Verify `CLIENT_AUTH_KEY` matches between Railway and client |
-| "Failed to fetch (unk)" / "A network error occurred" | JanitorAI cached old proxy config after changing URL or model | **Reload the page** — changes don't apply until refresh |
+| `403 Forbidden: Invalid or missing authentication` | Client key doesn't match `CLIENT_AUTH_KEY` | Make the client's API key identical to the env var, with no extra spaces or quotes. Regenerating the key and redeploying often clears stale values |
+| `Upstream NIM error (401/403)` | `NIM_API_KEY` is invalid or expired | Regenerate it at build.nvidia.com. The error is from NVIDIA, not the proxy |
+| `Upstream NIM error (404)` | Model was renamed or retired | Check the [NIM catalog](https://build.nvidia.com/) and update `models.js` |
+| `kimi-k3.1-pro` fails | NVIDIA hasn't opened API access yet | Use `kimi-k3` until the endpoint is public |
+| `400 Model not available` | The model is blocked (DeepSeek) | Pick another model |
+| Very slow responses | Large reasoning models at peak hours | Use a lighter model or set `reasoning_effort` to `low`/`off` |
+| `[Proxy: no output after 120s]` | Model produced nothing | Retry, switch models, or raise `THINKING_DEADLINE_MS` |
+| "Failed to fetch" in JanitorAI | Cached old proxy config | Reload the page after changing URL or model |
 
+Turn on `DEBUG_MODE=true` to see heartbeats, stream progress, and malformed upstream chunks.
+
+## Project layout
+
+```
+server.js      HTTP server, auth, request/response shaping, streaming
+config.js      Environment configuration and logger
+models.js      Alias mapping, model resolution, blocklist
+reasoning.js   Per-model reasoning payloads and reasoning stream normalization
+tools.js       Recovery of leaked <tool_call> blocks (stream and non-stream)
+utils.js       Shared helpers
+```
 
 ## Contributing
 
-This is a personal project I am maintaining for my own use, but I'm happy if it helps others. If you spot a bug, want to suggest a model mapping, or have a small improvement, feel free to open an issue or PR. I’ll attempt to respond to you pretty fast, I can’t promise ultra-fast responses but I’ll do my best.
+Issues and PRs are welcome, especially for model mapping updates (NIM deprecates things often), bug fixes, and docs. Large architectural changes and features that add complexity without clear benefit are less likely to be merged.
 
-### What I'm open to
-- Model mapping updates (NIM deprecates things constantly)
-- Bug fixes
-- Small feature additions that don't complicate the core flow
-- Documentation improvements
+When reporting a bug, include the model alias, whether streaming was on, the error message, and your hosting platform. Check Troubleshooting and the NIM catalog first.
 
-### What I'm less likely to merge
-- Major architectural changes.
-- Features I don't personally use (harder for me to maintain)
-- Anything that adds complexity without clear benefit
+Contact: Discord `Skywalker_1401`.
 
-## Issues
+## Credits and license
 
-Before opening an issue, check if it's already covered in the [Troubleshooting](#troubleshooting) section. If a model stopped working, it's probably deprecated by NVIDIA — check the [NIM catalog](https://build.nvidia.com/) first.
+Originally created by Jontte, building on a script from a Reddit guide. Released under the [MIT License](LICENSE).
 
-When reporting bugs, include:
-- Which model alias you were using
-- Whether streaming was enabled
-- The error message (or "All models failed" if that's what you got)
-- Your deployment platform (Railway, Render, etc.)
-
-## Contact
-Need to reach out faster? Add me on Discord, my username is - `Skywalker_1401`. I'll respond faster on Discord than Github.
-
-## Disclaimer
-
-I am not a professional developer. 
+This is a hobby project and is not affiliated with NVIDIA. You need your own NVIDIA API key and are subject to NVIDIA's terms and rate limits.
