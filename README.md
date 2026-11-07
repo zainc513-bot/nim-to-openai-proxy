@@ -73,12 +73,13 @@ Any alias below works, and so does any raw NIM ID such as `meta/muse-glimmer-30b
 | `nemotron-lightning` (legacy: `llama-3.1-8b`) | `nvidia/nemotron-3.5-lightning-30b-a3b` | General chat, quick tasks | Very fast | Low–Medium |
 | `kimi-k3` | `moonshotai/kimi-k3` | Deep RP and coding | Slow | Medium–High |
 | `kimi-k3.1-pro` | `moonshotai/kimi-k3.1-pro` | Agentic coding, 1M-token context | — | — |
+| `mistral-large-4` | `mistralai/mistral-large-4-1t-a52b` | Image understanding, function calling, structured output | — | — |
 | `glm-5.3` | `z-ai/glm-5.3` | General use | — | — |
 | `glm-flash`, `gpt-4-flash` | `z-ai/glm-5.3-flash` | Fast general use | — | — |
 | `claude-3-sonnet` | `openai/gpt-oss-20b` | Fast, distinct voice | Fast | Low–Medium |
 | `m3` | `minimaxai/minimax-m3` | Experimental | Medium–High | — |
 
-Speed and filter ratings are the maintainer's subjective notes, not benchmarks. "—" means untested.
+Speed and filter ratings are the maintainer's subjective notes, not benchmarks. "—" means untested. For a fuller breakdown (sizes, context, modalities, expected response times, quirks), see **[MODELS.md](MODELS.md)**, and use `bench.js` to measure latency on your own deployment.
 
 > **`kimi-k3.1-pro` is preview-only on NVIDIA's side.** At the time of writing, the model page says it is published for playground use and that no API key authorizes programmatic access yet. Requests will fail until NVIDIA opens the endpoint. The alias is ready for when they do.
 
@@ -104,6 +105,7 @@ Supported effort levels per model (invalid values are dropped with a warning):
 | `openai/gpt-oss-*` | `low`, `medium`, `high` |
 | `nvidia/nemotron-3-ultra-550b-a55b` | `none`, `medium`, `high` |
 | `moonshotai/kimi-k3`, `moonshotai/kimi-k3.1-pro` | `low`, `high`, `max` |
+| `mistralai/mistral-large-4-1t-a52b` | Passed through unvalidated (NVIDIA's example uses `high`) |
 | `meta/muse-glimmer-30b` | `none`, `minimal`, `low`, `medium`, `high`, `max` |
 | `minimaxai/minimax-m3` | on/off only |
 | GLM 5.3 | no parameters are sent |
@@ -155,6 +157,8 @@ Turn on `DEBUG_MODE=true` to see heartbeats, stream progress, and malformed upst
 server.js      HTTP server, auth, request/response shaping, streaming
 config.js      Environment configuration and logger
 models.js      Alias mapping, model resolution, blocklist
+MODELS.md      Model guide: strengths, expected speed, reasoning controls
+bench.js       Latency benchmark (time to first token, tokens/s) for your proxy
 reasoning.js   Per-model reasoning payloads and reasoning stream normalization
 tools.js       Recovery of leaked <tool_call> blocks (stream and non-stream)
 utils.js       Shared helpers

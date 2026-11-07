@@ -13,6 +13,9 @@ const MODEL_MAPPING = Object.freeze({
   'kimi-k3': 'moonshotai/kimi-k3',
   'kimi-k3.1-pro': 'moonshotai/kimi-k3.1-pro',
 
+  // Mistral AI
+  'mistral-large-4': 'mistralai/mistral-large-4-1t-a52b',
+
   // Z.ai GLM
   'glm-5.3': 'z-ai/glm-5.3',
   'glm-flash': 'z-ai/glm-5.3-flash',

@@ -24,6 +24,7 @@ const OPENAI_STYLE = new Set([
   'openai/gpt-oss-20b',
   'moonshotai/kimi-k3',
   'moonshotai/kimi-k3.1-pro',
+  'mistralai/mistral-large-4-1t-a52b',
   'meta/muse-glimmer-30b',
 ]);
 
