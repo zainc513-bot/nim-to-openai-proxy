@@ -4,6 +4,12 @@
 
 const flag = (name) => process.env[name] === 'true';
 
+// Env values often arrive with stray whitespace or wrapping quotes (dashboards, .env files).
+const secret = (name) => {
+  const v = process.env[name]?.trim().replace(/^(['"])(.*)\1$/, '$2').trim();
+  return v || undefined;
+};
+
 const int = (name, fallback) => {
   const n = Number.parseInt(process.env[name], 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -14,10 +20,10 @@ const config = Object.freeze({
 
   // Upstream
   nimApiBase: process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1',
-  nimApiKey: process.env.NIM_API_KEY,
+  nimApiKey: secret('NIM_API_KEY'),
 
   // Client-facing auth
-  clientAuthKey: process.env.CLIENT_AUTH_KEY,
+  clientAuthKey: secret('CLIENT_AUTH_KEY'),
 
   // Behaviour flags
   enableThinking: flag('ENABLE_THINKING_MODE'),

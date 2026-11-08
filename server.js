@@ -371,8 +371,16 @@ const clientKeyDigest = config.clientAuthKey ? digest(config.clientAuthKey) : nu
 
 function authenticate(req, res, next) {
   if (PUBLIC_PATHS.has(req.path)) return next();
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  const header = req.headers.authorization || '';
+  const token = header.replace(/^Bearer\s+/i, '').trim();
   if (token && clientKeyDigest && timingSafeEqual(digest(token), clientKeyDigest)) return next();
+
+  // Log why (never the key itself) so a 403 is diagnosable from the server logs.
+  const reason = !clientKeyDigest ? 'CLIENT_AUTH_KEY is not set on the server'
+    : !header ? 'no Authorization header'
+      : `key mismatch (received ${token.length} chars, expected ${config.clientAuthKey.length})`;
+  log.warn(`[AUTH] Rejected ${req.method} ${req.path}: ${reason}`);
+
   return res.status(403).json({
     error: { message: 'Forbidden: Invalid or missing authentication', type: 'authentication_error', code: 403 },
   });
