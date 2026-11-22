@@ -25,6 +25,11 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 // Verbose logging: reasoning payload per fallback attempt, full request/error bodies on failure.
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
+// Asks NIM to include token usage in streamed responses so it can be logged.
+// The usage chunk is stripped before forwarding unless the client asked for it.
+// Set LOG_STREAM_USAGE=false if a backend rejects stream_options.
+const LOG_STREAM_USAGE = process.env.LOG_STREAM_USAGE !== 'false';
+
 const MAX_TOKENS_LIMIT = 65536;
 
 // Shared keep-alive agent for connection reuse on long-lived deployments.
@@ -254,6 +259,39 @@ function safeWrite(res, data) {
   return false;
 }
 
+// ─── Helper: Completion Logging ──────────────────────────────────────────
+
+// One line per finished request: timing and token counts.
+// ttft = time to first visible token (content or reasoning), total = full
+// request time including any fallback attempts, tok_per_s = completion
+// tokens over the generation window (first token to finish).
+function logCompletion({ model, stream, outcome = 'completed', startedAt, firstTokenAt, usage }) {
+  const now = Date.now();
+  const totalMs = now - startedAt;
+  const parts = [`model=${model}`, `stream=${stream}`, `outcome=${outcome}`];
+
+  if (firstTokenAt) parts.push(`ttft=${firstTokenAt - startedAt}ms`);
+  parts.push(`total=${totalMs}ms`);
+
+  if (usage) {
+    const completion = usage.completion_tokens;
+    const reasoning = usage.completion_tokens_details?.reasoning_tokens;
+    parts.push(`prompt_tokens=${usage.prompt_tokens ?? '?'}`);
+    parts.push(`completion_tokens=${completion ?? '?'}`);
+    if (reasoning) parts.push(`reasoning_tokens=${reasoning}`);
+    parts.push(`total_tokens=${usage.total_tokens ?? '?'}`);
+
+    const genMs = now - (firstTokenAt || startedAt);
+    if (completion && genMs > 0) {
+      parts.push(`tok_per_s=${(completion / (genMs / 1000)).toFixed(1)}`);
+    }
+  } else {
+    parts.push('usage=unavailable');
+  }
+
+  console.log(`[USAGE] ${parts.join(' ')}`);
+}
+
 // ─── Helper: Fallback Chain ──────────────────────────────────────────────
 
 // Per-model cooldown after a 403/429, in-memory (resets on restart, not shared across instances).
@@ -451,6 +489,7 @@ app.get('/v1/models', async (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   let streamEndedCleanly = false;
   let upstreamStream = null;
+  const requestStartedAt = Date.now();
 
   try {
     const { model, max_tokens, temperature, stream, reasoning_effort } = req.body;
@@ -468,11 +507,18 @@ app.post('/v1/chat/completions', async (req, res) => {
     // reasoning_effort (translated per-model by getReasoningPayload).
     const { model: _droppedModel, reasoning_effort: _droppedReasoningEffort, ...forwardedFields } = req.body;
 
+    // If the client didn't ask for streamed usage, we request it ourselves for
+    // logging and strip it again before forwarding.
+    const clientWantsUsage = !!req.body.stream_options?.include_usage;
+
     const baseRequest = {
       ...forwardedFields,
       temperature: temperature ?? 0.7,
       max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
-      stream: stream || false
+      stream: stream || false,
+      ...(stream && LOG_STREAM_USAGE && {
+        stream_options: { ...forwardedFields.stream_options, include_usage: true }
+      })
     };
 
     const { response, model: usedModel } = await callWithFallback(
@@ -510,6 +556,22 @@ app.post('/v1/chat/completions', async (req, res) => {
       let cleanedUp = false;
       const normalizer = new StreamNormalizer(usedModel);
       const toolRecovery = new ToolCallStreamRecovery();
+      let firstTokenAt = null;
+      let streamUsage = null;
+      let completionLogged = false;
+
+      const logStreamCompletion = (outcome) => {
+        if (completionLogged) return;
+        completionLogged = true;
+        logCompletion({
+          model: usedModel,
+          stream: true,
+          outcome,
+          startedAt: requestStartedAt,
+          firstTokenAt,
+          usage: streamUsage
+        });
+      };
 
       const cleanup = () => {
         if (cleanedUp) return;
@@ -544,18 +606,26 @@ app.post('/v1/chat/completions', async (req, res) => {
           !reasoningOpen &&
           toolRecovery.buffer === '' &&
           !line.includes('reasoning') &&
-          !line.includes('<')
+          !line.includes('<') &&
+          !line.includes('"usage"')
         ) {
+          if (firstTokenAt === null && /"content"\s*:\s*"[^"]/.test(line)) {
+            firstTokenAt = Date.now();
+          }
           safeWrite(res, `${line.trimEnd()}\n\n`);
           return;
         }
 
         try {
           const data = JSON.parse(line.slice(6));
+          if (data.usage) streamUsage = data.usage;
           const delta = data.choices?.[0]?.delta;
 
           if (delta) {
             const normalizedDelta = normalizer.processDelta(delta);
+            if (firstTokenAt === null && (normalizedDelta.content || normalizedDelta.reasoning)) {
+              firstTokenAt = Date.now();
+            }
             let clientContent = '';
 
             if (SHOW_REASONING && inlineReasoning) {
@@ -592,6 +662,13 @@ app.post('/v1/chat/completions', async (req, res) => {
               delete delta.reasoning;
               delete delta.reasoning_content;
             }
+          }
+
+          // Usage was requested by the proxy for logging; don't leak it to
+          // clients that didn't ask for it (drop the usage-only chunk entirely).
+          if (data.usage && !clientWantsUsage) {
+            delete data.usage;
+            if (!data.choices || data.choices.length === 0) return;
           }
 
           safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
@@ -695,11 +772,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (!res.writableEnded) {
           res.end();
         }
+        logStreamCompletion('completed');
         cleanup();
       });
 
       upstreamStream.on('error', err => {
         console.error('[STREAM] Upstream error:', err.message);
+        logStreamCompletion('upstream_error');
         if (!res.writableEnded) {
           safeWrite(res, `data: ${JSON.stringify({
             error: {
@@ -717,6 +796,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         const clientGone = req.destroyed || !res.writable;
         if (!streamEndedCleanly && clientGone) {
           console.warn('[STREAM] Client disconnected prematurely');
+          logStreamCompletion('client_disconnected');
         }
         if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
           upstreamStream.destroy();
@@ -778,6 +858,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
 
       res.json(openaiResponse);
+
+      logCompletion({
+        model: usedModel,
+        stream: false,
+        startedAt: requestStartedAt,
+        firstTokenAt: null,
+        usage: response.data.usage
+      });
     }
   } catch (error) {
     console.error('[PROXY] Fatal error:', error.message);
