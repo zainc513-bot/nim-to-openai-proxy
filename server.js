@@ -31,7 +31,8 @@ const MAX_TOKENS_LIMIT = 65536;
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
   maxSockets: 50,
-  maxFreeSockets: 10
+  maxFreeSockets: 10,
+  noDelay: true // send small SSE frames immediately instead of coalescing (disables Nagle)
 });
 
 const nim = axios.create({
@@ -280,6 +281,18 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
   const activeModels = models.filter(m => !isInCooldown(m));
   const attemptOrder = activeModels.length > 0 ? activeModels : models;
 
+  // Streaming requests ask for uncompressed SSE: gzip/brotli buffer output
+  // into blocks, which defeats per-token delivery. Non-streaming requests
+  // keep default compression.
+  const upstreamHeaders = {
+    Authorization: `Bearer ${NIM_API_KEY}`,
+    'Content-Type': 'application/json',
+    ...(baseRequest.stream && {
+      'Accept': 'text/event-stream',
+      'Accept-Encoding': 'identity'
+    })
+  };
+
   for (const model of attemptOrder) {
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
@@ -293,10 +306,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
         '/chat/completions',
         fullRequest,
         {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
+          headers: upstreamHeaders,
           responseType: baseRequest.stream ? 'stream' : 'json',
           timeout: timeoutMs
         }
@@ -472,9 +482,19 @@ app.post('/v1/chat/completions', async (req, res) => {
     const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
     if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform'); // no-transform stops intermediaries from recompressing
       res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no'); // tells nginx-style reverse proxies not to buffer
+
+      // Send each SSE frame as its own packet
+      if (res.socket) {
+        res.socket.setNoDelay(true);
+        res.socket.setTimeout(0);
+      }
+
+      // Send headers now so the client sees the stream open immediately
+      res.flushHeaders();
 
       const decoder = new StringDecoder('utf8');
       let buffer = '';
