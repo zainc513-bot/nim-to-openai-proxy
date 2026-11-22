@@ -261,14 +261,30 @@ function safeWrite(res, data) {
 
 // ─── Helper: Completion Logging ──────────────────────────────────────────
 
+// Summarizes the reasoning setting actually sent upstream for the model that
+// answered. "default" means no reasoning field was sent, so the model used
+// its own built-in default (which for GLM 5.3 Flash is max).
+function describeReasoning(payload) {
+  if (!payload || Object.keys(payload).length === 0) return 'default';
+  const kw = payload.chat_template_kwargs || {};
+  if (payload.reasoning_effort) return String(payload.reasoning_effort);
+  if (kw.reasoning_effort) return String(kw.reasoning_effort);
+  if (kw.thinking_mode) return String(kw.thinking_mode);
+  if (payload.reasoning_budget !== undefined) return `budget:${payload.reasoning_budget}`;
+  if (kw.low_effort) return 'low';
+  if (kw.thinking === false || kw.enable_thinking === false) return 'off';
+  if (kw.thinking === true || kw.enable_thinking === true) return 'on';
+  return 'custom';
+}
+
 // One line per finished request: timing and token counts.
 // ttft = time to first visible token (content or reasoning), total = full
 // request time including any fallback attempts, tok_per_s = completion
 // tokens over the generation window (first token to finish).
-function logCompletion({ model, stream, outcome = 'completed', startedAt, firstTokenAt, usage }) {
+function logCompletion({ model, effort, stream, outcome = 'completed', startedAt, firstTokenAt, usage }) {
   const now = Date.now();
   const totalMs = now - startedAt;
-  const parts = [`model=${model}`, `stream=${stream}`, `outcome=${outcome}`];
+  const parts = [`model=${model}`, `effort=${effort ?? 'default'}`, `stream=${stream}`, `outcome=${outcome}`];
 
   if (firstTokenAt) parts.push(`ttft=${firstTokenAt - startedAt}ms`);
   parts.push(`total=${totalMs}ms`);
@@ -349,7 +365,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
           timeout: timeoutMs
         }
       );
-      return { response: res, model };
+      return { response: res, model, reasoningPayload };
     } catch (err) {
       lastError = err;
       const status = err.response?.status;
@@ -521,7 +537,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       })
     };
 
-    const { response, model: usedModel } = await callWithFallback(
+    const { response, model: usedModel, reasoningPayload: usedReasoningPayload } = await callWithFallback(
       baseRequest,
       modelChain,
       ENABLE_THINKING_MODE,
@@ -531,6 +547,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
+    const reasoningLabel = describeReasoning(usedReasoningPayload);
 
     const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
@@ -565,6 +582,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         completionLogged = true;
         logCompletion({
           model: usedModel,
+          effort: reasoningLabel,
           stream: true,
           outcome,
           startedAt: requestStartedAt,
@@ -861,6 +879,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       logCompletion({
         model: usedModel,
+        effort: reasoningLabel,
         stream: false,
         startedAt: requestStartedAt,
         firstTokenAt: null,
