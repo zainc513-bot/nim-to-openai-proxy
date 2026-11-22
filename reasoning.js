@@ -161,7 +161,11 @@ const REASONING_EFFORT_ENUMS = {
   'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
   'minimaxai/minimax-m3': ['adaptive'],
   'moonshotai/kimi-k3': ['low', 'high', 'max'],
-  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max']
+  // Assumed to match kimi-k3 (the alias in server.js points at k3.1-pro).
+  'moonshotai/kimi-k3.1-pro': ['low', 'high', 'max'],
+  'meta/muse-glimmer-30b': ['none', 'minimal', 'low', 'medium', 'high', 'max'],
+  // Per Z.ai's model card; other values fall back to "max" on the model side.
+  'z-ai/glm-5.3-flash': ['low', 'high', 'max']
 };
 
 function validReasoningEffort(model, effort) {
@@ -263,8 +267,19 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return { chat_template_kwargs: { thinking_mode: thinkingMode } };
     }
 
-    case 'moonshotai/kimi-k3': {
+    // The server.js alias 'kimi' points at k3.1-pro, so both IDs are handled.
+    case 'moonshotai/kimi-k3':
+    case 'moonshotai/kimi-k3.1-pro': {
       // No off-switch — omitting the field falls back to Kimi's own 'max'.
+      if (effort) return { reasoning_effort: effort };
+      return { reasoning_effort: enableThinking ? 'high' : 'low' };
+    }
+
+    // GLM 5.3 Flash: thinking can't be fully disabled, but reasoning_effort
+    // accepts low / high / max (Z.ai's model card), and the model defaults to
+    // "max" when the field is omitted — so always sending a value is a big
+    // latency win. Client "off" (or ENABLE_THINKING_MODE unset) maps to "low".
+    case 'z-ai/glm-5.3-flash': {
       if (effort) return { reasoning_effort: effort };
       return { reasoning_effort: enableThinking ? 'high' : 'low' };
     }
