@@ -340,6 +340,13 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       if (status === 429) {
         setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
       }
+
+      // Timeouts and upstream 5xx: skip this model briefly so following
+      // requests don't each wait out the same failure before falling back.
+      const timedOut = !status && (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT');
+      if (timedOut || (typeof status === 'number' && status >= 500)) {
+        setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
+      }
     }
   }
 
@@ -524,6 +531,22 @@ app.post('/v1/chat/completions', async (req, res) => {
             doneSent = true;
           }
           streamEndedCleanly = true;
+          return;
+        }
+
+        // Fast path: when a chunk needs no rewriting, forward it as-is and skip
+        // the JSON.parse/stringify round trip. Safe only if there is no
+        // reasoning field to strip or reformat, no '<' that could be part of a
+        // <tool_call> tag, no delimiter parser for this model, and no
+        // half-buffered tag or open <thinking> block from earlier chunks.
+        if (
+          !normalizer.parser &&
+          !reasoningOpen &&
+          toolRecovery.buffer === '' &&
+          !line.includes('reasoning') &&
+          !line.includes('<')
+        ) {
+          safeWrite(res, `${line.trimEnd()}\n\n`);
           return;
         }
 
@@ -800,9 +823,29 @@ app.use((req, res) => {
 
 // ─── Startup ──────────────────────────────────────────────────────────────
 
+// Keeps a pooled TLS connection to NIM alive so the first request after an
+// idle period doesn't pay for a fresh TCP + TLS handshake. Set
+// KEEP_WARM_INTERVAL_MS=0 to disable.
+const KEEP_WARM_INTERVAL_MS = process.env.KEEP_WARM_INTERVAL_MS !== undefined
+  ? Number(process.env.KEEP_WARM_INTERVAL_MS)
+  : 45000;
+
+function startKeepWarm() {
+  if (!KEEP_WARM_INTERVAL_MS || KEEP_WARM_INTERVAL_MS < 0) return;
+  const timer = setInterval(() => {
+    nim.head('/models', {
+      headers: { Authorization: `Bearer ${NIM_API_KEY}` },
+      timeout: 5000,
+      validateStatus: () => true // any response keeps the socket warm
+    }).catch(() => {});
+  }, KEEP_WARM_INTERVAL_MS);
+  timer.unref();
+}
+
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
+  startKeepWarm();
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
