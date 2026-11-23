@@ -38,6 +38,14 @@ const INLINE_REASONING_MODELS = new Set(
   (process.env.INLINE_REASONING_MODELS || '').split(',').map(s => s.trim()).filter(Boolean)
 );
 
+// While streaming, if the upstream goes quiet this long (e.g. a model thinking
+// on a huge prompt), send an SSE comment line so hosts, proxies and clients
+// don't treat the connection as dead. Comments are ignored by SSE parsers.
+// Set HEARTBEAT_INTERVAL_MS=0 to disable.
+const HEARTBEAT_INTERVAL_MS = process.env.HEARTBEAT_INTERVAL_MS !== undefined
+  ? Number(process.env.HEARTBEAT_INTERVAL_MS)
+  : 15000;
+
 const MAX_TOKENS_LIMIT = 65536;
 
 // Shared keep-alive agent for connection reuse on long-lived deployments.
@@ -103,6 +111,16 @@ const MODEL_MAPPING = {
   'm3.1': 'minimaxai/minimax-m3.1-flash',
   'kimi': 'moonshotai/kimi-k3.1-pro',
   'mistral-large': 'mistralai/mistral-large-4-1t-a52b', // always the damn comma
+};
+
+// Tried right after the alias's own model and BEFORE the generic
+// FALLBACK_MODELS, so a failing alias degrades to its closest sibling instead
+// of an unrelated model. moonshotai/kimi-k3 was this proxy's Kimi backend
+// until Oct 2026 (see git history); K3.1 Pro has been unavailable on NIM's API.
+// If a listed model isn't in the catalog the attempt just fails fast and the
+// chain moves on.
+const ALIAS_FALLBACKS = {
+  'kimi': ['moonshotai/kimi-k3']
 };
 
 // Used when an unrecognized alias is requested. Must point at a live model.
@@ -289,13 +307,24 @@ function describeReasoning(payload) {
 // ttft = time to first visible token (content or reasoning), total = full
 // request time including any fallback attempts, tok_per_s = completion
 // tokens over the generation window (first token to finish).
-function logCompletion({ model, effort, stream, outcome = 'completed', startedAt, firstTokenAt, usage }) {
+function logCompletion({ reqId, model, requestedModel, effort, stream, outcome = 'completed', startedAt, firstTokenAt, usage, stats }) {
   const now = Date.now();
   const totalMs = now - startedAt;
-  const parts = [`model=${model}`, `effort=${effort ?? 'default'}`, `stream=${stream}`, `outcome=${outcome}`];
+  const parts = [`model=${model}`];
+  // Present only when a different model than the alias's own answered.
+  if (requestedModel && requestedModel !== model) parts.push(`FELL_BACK_FROM=${requestedModel}`);
+  parts.push(`effort=${effort ?? 'default'}`, `stream=${stream}`, `outcome=${outcome}`);
 
   if (firstTokenAt) parts.push(`ttft=${firstTokenAt - startedAt}ms`);
   parts.push(`total=${totalMs}ms`);
+
+  // Streaming diagnostics: chunks = upstream SSE events received, max_gap =
+  // longest silence between two of them (a big gap with few chunks means the
+  // reply arrived in bursts), heartbeats = keep-alive comments we had to send.
+  if (stats) {
+    parts.push(`chunks=${stats.chunks}`, `max_gap=${stats.maxGapMs}ms`);
+    if (stats.heartbeats) parts.push(`heartbeats=${stats.heartbeats}`);
+  }
 
   if (usage) {
     const completion = usage.completion_tokens;
@@ -313,7 +342,7 @@ function logCompletion({ model, effort, stream, outcome = 'completed', startedAt
     parts.push('usage=unavailable');
   }
 
-  console.log(`[USAGE] ${parts.join(' ')}`);
+  console.log(`[USAGE${reqId ? ` #${reqId}` : ''}] ${parts.join(' ')}`);
 }
 
 // ─── Helper: Fallback Chain ──────────────────────────────────────────────
@@ -363,6 +392,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
     }
 
+    const attemptStartedAt = Date.now();
     try {
       const res = await nim.post(
         '/chat/completions',
@@ -373,13 +403,14 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
           timeout: timeoutMs
         }
       );
+      console.log(`[ATTEMPT] ${model} accepted the request after ${Date.now() - attemptStartedAt}ms (${res.status})`);
       return { response: res, model, reasoningPayload };
     } catch (err) {
       lastError = err;
       const status = err.response?.status;
 
       console.warn(
-        `[FALLBACK] Model failed: ${model}`,
+        `[FALLBACK] Model failed: ${model} after ${Date.now() - attemptStartedAt}ms`,
         status,
         err.response?.data?.error?.message || err.message
       );
@@ -514,6 +545,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   let streamEndedCleanly = false;
   let upstreamStream = null;
   const requestStartedAt = Date.now();
+  const reqId = Math.random().toString(36).slice(2, 8);
 
   try {
     const { model, max_tokens, temperature, stream, reasoning_effort } = req.body;
@@ -525,7 +557,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     // De-dupe: avoids retrying the same model twice if it's also in FALLBACK_MODELS.
-    const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
+    const modelChain = [...new Set([primaryModel, ...(ALIAS_FALLBACKS[model] || []), ...FALLBACK_MODELS])];
 
     // Forward all client fields except model (replaced per-attempt) and
     // reasoning_effort (translated per-model by getReasoningPayload).
@@ -544,6 +576,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         stream_options: { ...forwardedFields.stream_options, include_usage: true }
       })
     };
+
+    console.log(
+      `[REQ #${reqId}] alias=${model} -> ${primaryModel} stream=${!!stream} ` +
+      `messages=${Array.isArray(req.body.messages) ? req.body.messages.length : '?'} ` +
+      `max_tokens=${baseRequest.max_tokens} reasoning_effort=${reasoning_effort ?? 'unset'} ` +
+      `tools=${!!req.body.tools} chain=${modelChain.length}`
+    );
 
     const { response, model: usedModel, reasoningPayload: usedReasoningPayload } = await callWithFallback(
       baseRequest,
@@ -588,11 +627,33 @@ app.post('/v1/chat/completions', async (req, res) => {
       let streamUsage = null;
       let completionLogged = false;
 
+      // Stream diagnostics, reported in the [USAGE] line.
+      let chunkCount = 0;
+      let maxGapMs = 0;
+      let lastChunkAt = null;
+      let heartbeats = 0;
+      const streamOpenedAt = Date.now();
+
+      // Heartbeat: if nothing has arrived from upstream for a full interval,
+      // send an SSE comment so the connection isn't dropped as idle.
+      const heartbeat = HEARTBEAT_INTERVAL_MS > 0
+        ? setInterval(() => {
+            const idleMs = Date.now() - (lastChunkAt ?? streamOpenedAt);
+            if (idleMs >= HEARTBEAT_INTERVAL_MS && safeWrite(res, ': heartbeat\n\n')) {
+              heartbeats++;
+            }
+          }, Math.max(1000, Math.floor(HEARTBEAT_INTERVAL_MS / 2)))
+        : null;
+      if (heartbeat) heartbeat.unref();
+
       const logStreamCompletion = (outcome) => {
         if (completionLogged) return;
         completionLogged = true;
         logCompletion({
+          reqId,
+          stats: { chunks: chunkCount, maxGapMs, heartbeats },
           model: usedModel,
+          requestedModel: primaryModel,
           effort: reasoningLabel,
           stream: true,
           outcome,
@@ -605,6 +666,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const cleanup = () => {
         if (cleanedUp) return;
         cleanedUp = true;
+        if (heartbeat) clearInterval(heartbeat);
         if (upstreamStream) {
           upstreamStream.removeAllListeners();
         }
@@ -714,6 +776,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
 
       upstreamStream.on('data', chunk => {
+        const chunkAt = Date.now();
+        if (lastChunkAt !== null) maxGapMs = Math.max(maxGapMs, chunkAt - lastChunkAt);
+        lastChunkAt = chunkAt;
+        chunkCount++;
+
         buffer += decoder.write(chunk);
 
         if (buffer.length > MAX_BUFFER_SIZE) {
@@ -889,7 +956,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.json(openaiResponse);
 
       logCompletion({
+        reqId,
         model: usedModel,
+        requestedModel: primaryModel,
         effort: reasoningLabel,
         stream: false,
         startedAt: requestStartedAt,
