@@ -30,6 +30,14 @@ const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 // Set LOG_STREAM_USAGE=false if a backend rejects stream_options.
 const LOG_STREAM_USAGE = process.env.LOG_STREAM_USAGE !== 'false';
 
+// Backend model IDs (comma-separated, or "all") whose reasoning is streamed
+// inline in <thinking> tags without the client needing to send the
+// x-reasoning-format header. Requires SHOW_REASONING=true. Example:
+//   INLINE_REASONING_MODELS=moonshotai/kimi-k3.1-pro
+const INLINE_REASONING_MODELS = new Set(
+  (process.env.INLINE_REASONING_MODELS || '').split(',').map(s => s.trim()).filter(Boolean)
+);
+
 const MAX_TOKENS_LIMIT = 65536;
 
 // Shared keep-alive agent for connection reuse on long-lived deployments.
@@ -549,7 +557,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     console.log('[PROXY] Model used:', usedModel);
     const reasoningLabel = describeReasoning(usedReasoningPayload);
 
-    const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
+    const inlineReasoning =
+      req.headers['x-reasoning-format'] === 'inline' ||
+      INLINE_REASONING_MODELS.has('all') ||
+      INLINE_REASONING_MODELS.has(usedModel);
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
