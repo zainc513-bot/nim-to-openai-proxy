@@ -38,13 +38,42 @@ const INLINE_REASONING_MODELS = new Set(
   (process.env.INLINE_REASONING_MODELS || '').split(',').map(s => s.trim()).filter(Boolean)
 );
 
-// While streaming, if the upstream goes quiet this long (e.g. a model thinking
-// on a huge prompt), send an SSE comment line so hosts, proxies and clients
-// don't treat the connection as dead. Comments are ignored by SSE parsers.
+// Heartbeat: while streaming, every HEARTBEAT_INTERVAL_MS of upstream silence
+// (e.g. a model reading a huge prompt) the proxy sends an SSE comment line so
+// hosts, proxies and clients don't treat the connection as dead, and logs a
+// [HEARTBEAT] line confirming the request is still being waited on.
 // Set HEARTBEAT_INTERVAL_MS=0 to disable.
 const HEARTBEAT_INTERVAL_MS = process.env.HEARTBEAT_INTERVAL_MS !== undefined
   ? Number(process.env.HEARTBEAT_INTERVAL_MS)
-  : 15000;
+  : 10000;
+
+// Optional watchdog: if the upstream sends nothing at all for this long while
+// streaming, give up with a stream error instead of hanging. 0 = off (default),
+// because a very long prompt can legitimately take a minute or more to start.
+const STALL_TIMEOUT_MS = Number(process.env.STALL_TIMEOUT_MS) || 0;
+
+// Optional per-model speed limits, "model:limit,model:limit". The key can be
+// the backend model ID or the client alias (e.g. glm-flash).
+//   PROMPT_TOKEN_LIMITS=z-ai/glm-5.3-flash:48000  -> drop oldest chat messages
+//     until the estimated prompt fits (system messages and the last 2 messages
+//     are always kept). Long prompts are the main cause of slow first tokens.
+//   MAX_TOKENS_CAPS=z-ai/glm-5.3-flash:700         -> cap reply length.
+// Both are off unless set.
+const PROMPT_TOKEN_LIMITS = parseModelLimits(process.env.PROMPT_TOKEN_LIMITS);
+const MAX_TOKENS_CAPS = parseModelLimits(process.env.MAX_TOKENS_CAPS);
+
+function parseModelLimits(raw) {
+  const map = new Map();
+  for (const part of (raw || '').split(',')) {
+    const trimmed = part.trim();
+    const sep = trimmed.lastIndexOf(':');
+    if (sep <= 0) continue;
+    const key = trimmed.slice(0, sep).trim();
+    const value = Number(trimmed.slice(sep + 1));
+    if (key && Number.isFinite(value) && value > 0) map.set(key, value);
+  }
+  return map;
+}
 
 const MAX_TOKENS_LIMIT = 65536;
 
@@ -286,6 +315,38 @@ function safeWrite(res, data) {
 }
 
 // ─── Helper: Completion Logging ──────────────────────────────────────────
+
+// Rough token estimate (about 3.5 characters per token for English prose, plus
+// a few tokens of per-message overhead). Only used for the optional trimming.
+function estimateMessageTokens(message) {
+  const content = message?.content;
+  let chars = 0;
+  if (typeof content === 'string') chars = content.length;
+  else if (Array.isArray(content)) {
+    for (const part of content) if (typeof part?.text === 'string') chars += part.text.length;
+  }
+  return Math.ceil(chars / 3.5) + 4;
+}
+
+// Drops the oldest non-system messages until the estimated prompt fits the
+// budget. System messages and the last `keepTail` messages are never dropped.
+function trimMessagesToBudget(messages, budgetTokens, keepTail = 2) {
+  if (!Array.isArray(messages) || !budgetTokens) return { messages, dropped: 0 };
+
+  let total = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+  const before = total;
+  if (total <= budgetTokens) return { messages, dropped: 0, before, after: total };
+
+  const result = [...messages];
+  let dropped = 0;
+  for (let i = 0; i < result.length - keepTail && total > budgetTokens;) {
+    if (result[i].role === 'system') { i++; continue; }
+    total -= estimateMessageTokens(result[i]);
+    result.splice(i, 1);
+    dropped++;
+  }
+  return { messages: result, dropped, before, after: total };
+}
 
 // Summarizes the reasoning setting actually sent upstream for the model that
 // answered. "default" means no reasoning field was sent, so the model used
@@ -567,10 +628,28 @@ app.post('/v1/chat/completions', async (req, res) => {
     // logging and strip it again before forwarding.
     const clientWantsUsage = !!req.body.stream_options?.include_usage;
 
+    // Optional speed limits (see PROMPT_TOKEN_LIMITS / MAX_TOKENS_CAPS). Skipped
+    // for tool-calling requests, where dropping messages could orphan a tool
+    // result from its call.
+    let outgoingMessages = forwardedFields.messages;
+    const promptLimit = PROMPT_TOKEN_LIMITS.get(primaryModel) ?? PROMPT_TOKEN_LIMITS.get(model);
+    if (promptLimit && !req.body.tools) {
+      const trimmed = trimMessagesToBudget(outgoingMessages, promptLimit);
+      if (trimmed.dropped > 0) {
+        outgoingMessages = trimmed.messages;
+        console.log(
+          `[TRIM #${reqId}] dropped ${trimmed.dropped} oldest messages ` +
+          `(~${trimmed.before} -> ~${trimmed.after} est. tokens, limit ${promptLimit})`
+        );
+      }
+    }
+    const tokenCap = MAX_TOKENS_CAPS.get(primaryModel) ?? MAX_TOKENS_CAPS.get(model);
+
     const baseRequest = {
       ...forwardedFields,
+      ...(outgoingMessages !== undefined && { messages: outgoingMessages }),
       temperature: temperature ?? 0.7,
-      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
+      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT, tokenCap || Infinity),
       stream: stream || false,
       ...(stream && LOG_STREAM_USAGE && {
         stream_options: { ...forwardedFields.stream_options, include_usage: true }
@@ -636,13 +715,39 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Heartbeat: if nothing has arrived from upstream for a full interval,
       // send an SSE comment so the connection isn't dropped as idle.
-      const heartbeat = HEARTBEAT_INTERVAL_MS > 0
+      let lastBeatAt = 0;
+      const heartbeat = (HEARTBEAT_INTERVAL_MS > 0 || STALL_TIMEOUT_MS > 0)
         ? setInterval(() => {
-            const idleMs = Date.now() - (lastChunkAt ?? streamOpenedAt);
-            if (idleMs >= HEARTBEAT_INTERVAL_MS && safeWrite(res, ': heartbeat\n\n')) {
-              heartbeats++;
+            const now = Date.now();
+            const idleMs = now - (lastChunkAt ?? streamOpenedAt);
+
+            // Watchdog: upstream has said nothing for too long, give up cleanly.
+            if (STALL_TIMEOUT_MS > 0 && idleMs >= STALL_TIMEOUT_MS) {
+              console.error(`[HEARTBEAT #${reqId}] upstream silent for ${Math.round(idleMs / 1000)}s (limit ${Math.round(STALL_TIMEOUT_MS / 1000)}s), aborting`);
+              safeWrite(res, `data: ${JSON.stringify({
+                error: { message: 'Upstream stalled', type: 'stream_stalled' }
+              })}\n\n`);
+              safeWrite(res, 'data: [DONE]\n\n');
+              logStreamCompletion('stalled');
+              if (!res.writableEnded) res.end();
+              if (upstreamStream && !upstreamStream.destroyed) upstreamStream.destroy();
+              cleanup();
+              return;
             }
-          }, Math.max(1000, Math.floor(HEARTBEAT_INTERVAL_MS / 2)))
+
+            // Liveness beat: one every HEARTBEAT_INTERVAL_MS of silence.
+            const quietSince = Math.max(lastChunkAt ?? streamOpenedAt, lastBeatAt);
+            if (HEARTBEAT_INTERVAL_MS > 0 && now - quietSince >= HEARTBEAT_INTERVAL_MS) {
+              if (safeWrite(res, ': heartbeat\n\n')) {
+                heartbeats++;
+                lastBeatAt = now;
+                console.log(
+                  `[HEARTBEAT #${reqId}] alive, upstream quiet ${Math.round(idleMs / 1000)}s ` +
+                  `(elapsed ${Math.round((now - requestStartedAt) / 1000)}s, chunks=${chunkCount}, beats=${heartbeats})`
+                );
+              }
+            }
+          }, 1000)
         : null;
       if (heartbeat) heartbeat.unref();
 
