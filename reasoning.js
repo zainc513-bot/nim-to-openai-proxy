@@ -274,9 +274,11 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     case 'moonshotai/kimi-k3':
     case 'moonshotai/kimi-k3.1-pro': {
       // Always "low", no matter what the client sends (reasoning_effort,
-      // "on"/"off") or what ENABLE_THINKING_MODE is set to. Kimi has no
-      // off-switch, and omitting the field makes it fall back to 'max', so a
-      // value is always sent. Change KIMI_FORCED_EFFORT to use another level.
+      // "on"/"off") or what ENABLE_THINKING_MODE is set to. NVIDIA's API
+      // reference for kimi-k3.1-pro says the endpoint default is already
+      // "low" and the valid values are low / high / max; the value is still
+      // sent explicitly so it can't drift if that default changes. Change
+      // KIMI_FORCED_EFFORT to use another level.
       return { reasoning_effort: KIMI_FORCED_EFFORT };
     }
 
@@ -294,8 +296,63 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
   }
 }
 
+// ─── Native request shape: Kimi K3.1 Pro ────────────────────────────────
+// NVIDIA's API reference for moonshotai/kimi-k3.1-pro documents exactly these
+// request fields: messages, model, tools, max_tokens, seed, stream,
+// stream_options and reasoning_effort. Frontends like JanitorAI also send
+// temperature, top_p, frequency/presence penalties, stop, etc. and this proxy
+// adds a default temperature, none of which the endpoint documents. Sending
+// only the documented fields keeps the request exactly what the endpoint
+// expects, so an unsupported field can't get the request rejected (which would
+// otherwise silently drop the request onto a fallback model).
+//
+//   KIMI_STRICT_PARAMS=false     -> send everything, like every other model
+//   KIMI_EXTRA_FIELDS=temperature,top_p -> also forward these fields
+const KIMI_NATIVE_MODELS = new Set(['moonshotai/kimi-k3.1-pro']);
+const KIMI_NATIVE_FIELDS = [
+  'messages', 'model', 'tools', 'max_tokens', 'seed',
+  'stream', 'stream_options', 'reasoning_effort'
+];
+const KIMI_EXTRA_FIELDS = (process.env.KIMI_EXTRA_FIELDS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const KIMI_STRICT_PARAMS = process.env.KIMI_STRICT_PARAMS !== 'false';
+
+// The API reference says system and assistant messages must have string
+// content (the content-parts list is only supported for user messages).
+function flattenTextContent(message) {
+  if (!message || !Array.isArray(message.content)) return message;
+  if (message.role !== 'system' && message.role !== 'assistant') return message;
+  const text = message.content
+    .map(part => (typeof part === 'string' ? part : (part && typeof part.text === 'string' ? part.text : '')))
+    .filter(Boolean)
+    .join('\n');
+  return { ...message, content: text };
+}
+
+// Returns { request, dropped } where `dropped` lists removed field names.
+// Models other than the ones above are returned unchanged.
+function shapeRequestForModel(model, request) {
+  if (!KIMI_STRICT_PARAMS || !KIMI_NATIVE_MODELS.has(model)) {
+    return { request, dropped: [] };
+  }
+
+  const allowed = new Set([...KIMI_NATIVE_FIELDS, ...KIMI_EXTRA_FIELDS]);
+  const shaped = {};
+  const dropped = [];
+  for (const [key, value] of Object.entries(request)) {
+    if (value === undefined) continue;
+    if (allowed.has(key)) shaped[key] = value;
+    else dropped.push(key);
+  }
+  if (Array.isArray(shaped.messages)) {
+    shaped.messages = shaped.messages.map(flattenTextContent);
+  }
+  return { request: shaped, dropped };
+}
+
 module.exports = {
   SHOW_REASONING,
+  shapeRequestForModel,
   getReasoningPayload,
   resolveEffectiveThinking,
   StreamNormalizer,

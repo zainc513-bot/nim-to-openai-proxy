@@ -7,7 +7,7 @@ const axios = require('axios');
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
 const { timingSafeEqual } = require('crypto');
-const { SHOW_REASONING, getReasoningPayload, resolveEffectiveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
+const { SHOW_REASONING, shapeRequestForModel, getReasoningPayload, resolveEffectiveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
 const { extractLeakedToolCalls, ToolCallStreamRecovery } = require('./tools');
 
 const app = express();
@@ -51,6 +51,16 @@ const HEARTBEAT_INTERVAL_MS = process.env.HEARTBEAT_INTERVAL_MS !== undefined
 // waiting for NIM to accept the request, so the client doesn't time out during
 // long queues or fallbacks. Set EARLY_STREAM_HEADERS=false to disable.
 const EARLY_STREAM_HEADERS = process.env.EARLY_STREAM_HEADERS !== 'false';
+
+// Hedging: if the first model hasn't answered after this many ms, also start
+// the next model in the chain and use whichever responds first. NIM can queue
+// requests for minutes, so this caps how long one slow model can hold you up.
+// Costs extra requests (and rate limit) only when the first model is slow, and
+// the reply may come from a different model than the one you picked.
+// Set HEDGE_AFTER_MS=0 to disable (strictly one model at a time).
+const HEDGE_AFTER_MS = process.env.HEDGE_AFTER_MS !== undefined
+  ? Number(process.env.HEDGE_AFTER_MS)
+  : 30000;
 
 // Optional watchdog: if the upstream sends nothing at all for this long while
 // streaming, give up with a stream error instead of hanging. 0 = off (default),
@@ -458,8 +468,161 @@ function setCooldown(model, ms) {
   modelCooldowns.set(model, Date.now() + ms);
 }
 
-async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
-  let lastError = null;
+// NVIDIA's errors come back as problem+json ({ title, detail, requestId, ... })
+// rather than OpenAI's { error: { message } }, and for streaming requests the
+// error body arrives as an unread stream, so a plain err.message only says
+// "Request failed with status code 4xx". This reads the body (max ~4 KB, 2 s)
+// and returns a readable one-line reason, e.g. a 422 naming the bad field.
+async function describeUpstreamError(err) {
+  const data = err?.response?.data;
+  if (!data) return err?.message || 'unknown error';
+
+  let body = data;
+  if (typeof data.on === 'function') {
+    body = await new Promise(resolve => {
+      let text = '';
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { data.destroy(); } catch { /* ignore */ }
+        resolve(text);
+      };
+      const timer = setTimeout(finish, 2000);
+      data.on('data', chunk => {
+        text += chunk.toString('utf8');
+        if (text.length > 4096) finish();
+      });
+      data.on('end', finish);
+      data.on('error', finish);
+    });
+  }
+
+  let parsed = body;
+  if (typeof body === 'string') {
+    try { parsed = JSON.parse(body); } catch { /* keep raw text */ }
+  }
+
+  let reason;
+  if (parsed && typeof parsed === 'object') {
+    reason =
+      parsed.detail || parsed.error?.message || parsed.message || parsed.title ||
+      JSON.stringify(parsed).slice(0, 300);
+    if (parsed.requestId) reason += ` (requestId ${parsed.requestId})`;
+  } else {
+    reason = String(parsed || '').trim().slice(0, 300);
+  }
+  return reason ? `${err.message}: ${reason}` : err.message;
+}
+
+// Logs once per model and field set when native request shaping removes
+// fields, so you can see what was filtered without flooding the log.
+const loggedNativeDrops = new Set();
+function logNativeDrops(model, dropped) {
+  if (!dropped || dropped.length === 0) return;
+  const key = `${model}|${dropped.join(',')}`;
+  if (loggedNativeDrops.has(key)) return;
+  loggedNativeDrops.add(key);
+  console.log(`[NATIVE] ${model}: not sending fields outside NVIDIA's documented schema: ${dropped.join(', ')}`);
+}
+
+// Runs attempts against `models` in order and resolves with the first success.
+//
+// - If an attempt fails, the next model starts immediately (classic fallback).
+// - If hedgeAfterMs > 0 and an attempt is still pending after that long, the
+//   next model is started IN PARALLEL ("hedging"). Whichever answers first
+//   wins and the others are cancelled. NIM can queue a request for minutes, so
+//   this stops one slow model from holding up the whole reply.
+// - hedgeAfterMs = 0 means no hedging: strictly one model at a time.
+// An error with `fatalForChain` set (e.g. a 401) aborts everything at once.
+function raceAttempts(models, attemptFn, hedgeAfterMs, reqId) {
+  return new Promise((resolve, reject) => {
+    let nextIdx = 0;
+    let active = 0;
+    let settled = false;
+    let lastError = null;
+    let hedgeTimer = null;
+    const controllers = new Map(); // model -> AbortController
+    const tag = reqId ? ` #${reqId}` : '';
+
+    const cancelOthers = (exceptModel) => {
+      let cancelled = 0;
+      for (const [m, c] of controllers) {
+        if (m !== exceptModel) { c.abort(); cancelled++; }
+      }
+      return cancelled;
+    };
+
+    const armHedge = () => {
+      clearTimeout(hedgeTimer);
+      if (settled || hedgeAfterMs <= 0 || nextIdx >= models.length) return;
+      hedgeTimer = setTimeout(() => {
+        if (settled || nextIdx >= models.length) return;
+        console.log(
+          `[HEDGE${tag}] no answer after ${Math.round(hedgeAfterMs / 1000)}s, ` +
+          `also trying ${models[nextIdx]} (still waiting on ${active} other attempt${active === 1 ? '' : 's'})`
+        );
+        launch();
+      }, hedgeAfterMs);
+      if (hedgeTimer.unref) hedgeTimer.unref();
+    };
+
+    const launch = () => {
+      if (settled || nextIdx >= models.length) return;
+      const model = models[nextIdx++];
+      const controller = new AbortController();
+      controllers.set(model, controller);
+      active++;
+
+      attemptFn(model, controller.signal).then(result => {
+        active--;
+        controllers.delete(model);
+        if (settled) {
+          // Lost the race but finished anyway: don't leave its stream open.
+          try { result.response?.data?.destroy?.(); } catch { /* ignore */ }
+          return;
+        }
+        settled = true;
+        clearTimeout(hedgeTimer);
+        const cancelled = cancelOthers(model);
+        if (cancelled > 0) {
+          console.log(`[HEDGE${tag}] ${model} answered first, cancelled ${cancelled} other attempt${cancelled === 1 ? '' : 's'}`);
+        }
+        resolve(result);
+      }).catch(err => {
+        active--;
+        controllers.delete(model);
+        if (settled) return; // cancelled loser or late failure: ignore
+        lastError = err;
+
+        if (err && err.fatalForChain) {
+          settled = true;
+          clearTimeout(hedgeTimer);
+          cancelOthers(null);
+          reject(err);
+          return;
+        }
+
+        if (active === 0) {
+          if (nextIdx < models.length) {
+            launch(); // nothing running: move to the next model right away
+          } else {
+            settled = true;
+            clearTimeout(hedgeTimer);
+            reject(lastError || new Error('All models failed'));
+          }
+        }
+      });
+
+      armHedge();
+    };
+
+    launch();
+  });
+}
+
+async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools, reqId) {
   const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
     ? REASONING_REQUEST_TIMEOUT_MS
     : REQUEST_TIMEOUT_MS;
@@ -480,9 +643,14 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
     })
   };
 
-  for (const model of attemptOrder) {
+  // One attempt against one model.
+  const attempt = async (model, signal) => {
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
-    const fullRequest = { ...baseRequest, model, ...reasoningPayload };
+    const { request: fullRequest, dropped } = shapeRequestForModel(
+      model,
+      { ...baseRequest, model, ...reasoningPayload }
+    );
+    logNativeDrops(model, dropped);
 
     if (DEBUG_MODE) {
       console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
@@ -496,28 +664,32 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
         {
           headers: upstreamHeaders,
           responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: timeoutMs
+          timeout: timeoutMs,
+          signal
         }
       );
       console.log(`[ATTEMPT] ${model} accepted the request after ${Date.now() - attemptStartedAt}ms (${res.status})`);
       return { response: res, model, reasoningPayload };
     } catch (err) {
-      lastError = err;
+      // Cancelled because another model won the race: not a real failure.
+      if (axios.isCancel(err)) throw err;
+
       const status = err.response?.status;
 
+      const errorText = await describeUpstreamError(err);
       console.warn(
         `[FALLBACK] Model failed: ${model} after ${Date.now() - attemptStartedAt}ms`,
         status,
-        err.response?.data?.error?.message || err.message
+        errorText
       );
       if (DEBUG_MODE) {
         console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
-        console.log(`[DEBUG] Full upstream error response:`, JSON.stringify(err.response?.data || null));
+        console.log(`[DEBUG] Full upstream error response:`, errorText);
       }
 
       // Same key for every attempt: a 401 means every remaining model would fail identically.
       if (status === 401) {
-        throw err;
+        err.fatalForChain = true;
       }
 
       // 403: likely an access-tier issue, not a dead key — cooldown just this model.
@@ -536,10 +708,12 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       if (timedOut || (typeof status === 'number' && status >= 500)) {
         setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
       }
-    }
-  }
 
-  throw lastError || new Error('All models failed');
+      throw err;
+    }
+  };
+
+  return raceAttempts(attemptOrder, attempt, HEDGE_AFTER_MS, reqId);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────
@@ -731,7 +905,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         modelChain,
         ENABLE_THINKING_MODE,
         reasoning_effort,
-        !!req.body.tools
+        !!req.body.tools,
+        reqId
       );
     } finally {
       if (waitBeat) clearInterval(waitBeat);
