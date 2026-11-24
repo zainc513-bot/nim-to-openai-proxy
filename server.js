@@ -504,11 +504,18 @@ async function describeUpstreamError(err) {
     try { parsed = JSON.parse(body); } catch { /* keep raw text */ }
   }
 
+  if (parsed && typeof parsed === 'object') err.upstreamBody = parsed;
+
   let reason;
   if (parsed && typeof parsed === 'object') {
+    const d = parsed.detail;
+    const detailText = Array.isArray(d)
+      ? d.map(x => `${Array.isArray(x?.loc) ? x.loc.join('.') : '?'}: ${x?.msg || x?.type || ''}`).join('; ')
+      : d;
     reason =
-      parsed.detail || parsed.error?.message || parsed.message || parsed.title ||
+      detailText || parsed.error?.message || parsed.message || parsed.title ||
       JSON.stringify(parsed).slice(0, 300);
+    if (typeof reason !== 'string') reason = JSON.stringify(reason).slice(0, 300);
     if (parsed.requestId) reason += ` (requestId ${parsed.requestId})`;
   } else {
     reason = String(parsed || '').trim().slice(0, 300);
@@ -516,15 +523,53 @@ async function describeUpstreamError(err) {
   return reason ? `${err.message}: ${reason}` : err.message;
 }
 
-// Logs once per model and field set when native request shaping removes
-// fields, so you can see what was filtered without flooding the log.
+// Logs once per model and change set when native request shaping removes
+// fields or clamps values, so you can see what was adjusted without flooding
+// the log.
 const loggedNativeDrops = new Set();
-function logNativeDrops(model, dropped) {
-  if (!dropped || dropped.length === 0) return;
-  const key = `${model}|${dropped.join(',')}`;
+function logNativeDrops(model, dropped, clamped = []) {
+  const parts = [];
+  if (dropped && dropped.length) parts.push(`not sending fields outside NVIDIA's documented schema: ${dropped.join(', ')}`);
+  if (clamped && clamped.length) parts.push(`clamped to NVIDIA's documented limits: ${clamped.join(', ')}`);
+  if (parts.length === 0) return;
+  const key = `${model}|${parts.join('|')}`;
   if (loggedNativeDrops.has(key)) return;
   loggedNativeDrops.add(key);
-  console.log(`[NATIVE] ${model}: not sending fields outside NVIDIA's documented schema: ${dropped.join(', ')}`);
+  console.log(`[NATIVE] ${model}: ${parts.join('; ')}`);
+}
+
+// Fields a model has rejected with a 422 during this process's lifetime, so
+// later requests don't send them again. Never includes the core fields.
+const PROTECTED_FIELDS = new Set(['messages', 'model', 'stream', 'max_tokens']);
+const rejectedFields = new Map(); // model -> Set(field)
+function rememberRejectedFields(model, fields) {
+  const set = rejectedFields.get(model) || new Set();
+  for (const f of fields) set.add(f);
+  rejectedFields.set(model, set);
+}
+
+// Works out which request fields a 422 is complaining about. Handles the
+// FastAPI style { detail: [{ loc: ['body', 'field'], msg }] } and, as a
+// fallback, any of our field names mentioned in the error text.
+function findRejectedFields(err, request) {
+  const body = err?.upstreamBody;
+  const found = new Set();
+  const detail = body?.detail;
+  if (Array.isArray(detail)) {
+    for (const item of detail) {
+      const loc = Array.isArray(item?.loc) ? item.loc : [];
+      const key = loc[0] === 'body' ? loc[1] : loc[0];
+      if (typeof key === 'string') found.add(key);
+    }
+  } else {
+    const text = typeof detail === 'string' ? detail : (body?.message || body?.error?.message || '');
+    if (text) {
+      for (const key of Object.keys(request)) {
+        if (new RegExp(`\\b${key}\\b`).test(text)) found.add(key);
+      }
+    }
+  }
+  return [...found].filter(k => k in request && !PROTECTED_FIELDS.has(k));
 }
 
 // Runs attempts against `models` in order and resolves with the first success.
@@ -646,70 +691,95 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
   // One attempt against one model.
   const attempt = async (model, signal) => {
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
-    const { request: fullRequest, dropped } = shapeRequestForModel(
+    const shaped = shapeRequestForModel(
       model,
       { ...baseRequest, model, ...reasoningPayload }
     );
-    logNativeDrops(model, dropped);
+    let fullRequest = shaped.request;
+    logNativeDrops(model, shaped.dropped, shaped.clamped);
+
+    // Fields this model already rejected earlier in this process's lifetime.
+    const learned = rejectedFields.get(model);
+    if (learned && learned.size > 0) {
+      fullRequest = { ...fullRequest };
+      for (const f of learned) delete fullRequest[f];
+    }
 
     if (DEBUG_MODE) {
       console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
     }
 
     const attemptStartedAt = Date.now();
-    try {
-      const res = await nim.post(
-        '/chat/completions',
-        fullRequest,
-        {
-          headers: upstreamHeaders,
-          responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: timeoutMs,
-          signal
+    for (let retries = 0; ; retries++) {
+      try {
+        const res = await nim.post(
+          '/chat/completions',
+          fullRequest,
+          {
+            headers: upstreamHeaders,
+            responseType: baseRequest.stream ? 'stream' : 'json',
+            timeout: timeoutMs,
+            signal
+          }
+        );
+        console.log(`[ATTEMPT] ${model} accepted the request after ${Date.now() - attemptStartedAt}ms (${res.status})`);
+        return { response: res, model, reasoningPayload };
+      } catch (err) {
+        // Cancelled because another model won the race: not a real failure.
+        if (axios.isCancel(err)) throw err;
+
+        const status = err.response?.status;
+        const errorText = await describeUpstreamError(err);
+
+        // Self-heal: a 422 that names the request fields it dislikes is
+        // retried on the SAME model without them (at most twice), and the
+        // fields are remembered so later requests skip them. This keeps the
+        // request on the model you picked instead of falling back.
+        if (status === 422 && retries < 2) {
+          const bad = findRejectedFields(err, fullRequest);
+          if (bad.length > 0) {
+            fullRequest = { ...fullRequest };
+            for (const f of bad) delete fullRequest[f];
+            rememberRejectedFields(model, bad);
+            console.warn(`[SELF-HEAL] ${model} rejected ${bad.join(', ')} (422: ${errorText}); retrying without it and skipping it for this model from now on`);
+            continue;
+          }
         }
-      );
-      console.log(`[ATTEMPT] ${model} accepted the request after ${Date.now() - attemptStartedAt}ms (${res.status})`);
-      return { response: res, model, reasoningPayload };
-    } catch (err) {
-      // Cancelled because another model won the race: not a real failure.
-      if (axios.isCancel(err)) throw err;
 
-      const status = err.response?.status;
+        console.warn(
+          `[FALLBACK] Model failed: ${model} after ${Date.now() - attemptStartedAt}ms`,
+          status,
+          errorText
+        );
+        if (DEBUG_MODE) {
+          console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
+          console.log(`[DEBUG] Full upstream error response:`, errorText);
+        }
 
-      const errorText = await describeUpstreamError(err);
-      console.warn(
-        `[FALLBACK] Model failed: ${model} after ${Date.now() - attemptStartedAt}ms`,
-        status,
-        errorText
-      );
-      if (DEBUG_MODE) {
-        console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
-        console.log(`[DEBUG] Full upstream error response:`, errorText);
+        // Same key for every attempt: a 401 means every remaining model would fail identically.
+        if (status === 401) {
+          err.fatalForChain = true;
+        }
+
+        // 403: likely an access-tier issue, not a dead key — cooldown just this model.
+        if (status === 403) {
+          setCooldown(model, ACCESS_DENIED_COOLDOWN_MS);
+        }
+
+        // 429: rate limited — short cooldown.
+        if (status === 429) {
+          setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
+        }
+
+        // Timeouts and upstream 5xx: skip this model briefly so following
+        // requests don't each wait out the same failure before falling back.
+        const timedOut = !status && (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT');
+        if (timedOut || (typeof status === 'number' && status >= 500)) {
+          setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
+        }
+
+        throw err;
       }
-
-      // Same key for every attempt: a 401 means every remaining model would fail identically.
-      if (status === 401) {
-        err.fatalForChain = true;
-      }
-
-      // 403: likely an access-tier issue, not a dead key — cooldown just this model.
-      if (status === 403) {
-        setCooldown(model, ACCESS_DENIED_COOLDOWN_MS);
-      }
-
-      // 429: rate limited — short cooldown.
-      if (status === 429) {
-        setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
-      }
-
-      // Timeouts and upstream 5xx: skip this model briefly so following
-      // requests don't each wait out the same failure before falling back.
-      const timedOut = !status && (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT');
-      if (timedOut || (typeof status === 'number' && status >= 500)) {
-        setCooldown(model, RATE_LIMIT_COOLDOWN_MS);
-      }
-
-      throw err;
     }
   };
 

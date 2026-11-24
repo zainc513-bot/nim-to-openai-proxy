@@ -296,29 +296,53 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
   }
 }
 
-// ─── Native request shape: Kimi K3.1 Pro ────────────────────────────────
-// NVIDIA's API reference for moonshotai/kimi-k3.1-pro documents exactly these
-// request fields: messages, model, tools, max_tokens, seed, stream,
-// stream_options and reasoning_effort. Frontends like JanitorAI also send
-// temperature, top_p, frequency/presence penalties, stop, etc. and this proxy
-// adds a default temperature, none of which the endpoint documents. Sending
-// only the documented fields keeps the request exactly what the endpoint
-// expects, so an unsupported field can't get the request rejected (which would
-// otherwise silently drop the request onto a fallback model).
+// ─── Native request shapes ───────────────────────────────────────────────
+// Per-model profiles built from NVIDIA's own API reference pages. Each profile
+// lists the request fields the hosted endpoint documents, so nothing it
+// doesn't expect is sent, and (for GLM) the documented numeric limits, so a
+// frontend slider value outside them is clamped instead of getting a 422
+// validation error (which would silently drop the request onto a fallback
+// model).
 //
-//   KIMI_STRICT_PARAMS=false     -> send everything, like every other model
-//   KIMI_EXTRA_FIELDS=temperature,top_p -> also forward these fields
-const KIMI_NATIVE_MODELS = new Set(['moonshotai/kimi-k3.1-pro']);
-const KIMI_NATIVE_FIELDS = [
-  'messages', 'model', 'tools', 'max_tokens', 'seed',
-  'stream', 'stream_options', 'reasoning_effort'
-];
-const KIMI_EXTRA_FIELDS = (process.env.KIMI_EXTRA_FIELDS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const KIMI_STRICT_PARAMS = process.env.KIMI_STRICT_PARAMS !== 'false';
+// Fields this proxy needs beyond the documented schema are kept on purpose:
+//   reasoning_effort  - the only way to lower reasoning
+//   stream_options    - lets the proxy log token usage for streams
+//   tools/tool_choice - GLM only, so function calling keeps working
+//
+// Per model, set <LABEL>_STRICT_PARAMS=false to send everything unchanged, or
+// <LABEL>_EXTRA_FIELDS=a,b to also forward those fields (LABEL = KIMI or GLM).
+const NATIVE_PROFILES = new Map([
+  // https://build.nvidia.com/moonshotai/kimi-k3_1-pro/apireference
+  ['moonshotai/kimi-k3.1-pro', {
+    label: 'KIMI',
+    fields: ['messages', 'model', 'tools', 'max_tokens', 'seed', 'stream', 'stream_options', 'reasoning_effort'],
+    flattenSystemAssistant: true, // system/assistant content must be a string
+    clamp: {}
+  }],
+  // https://build.nvidia.com/z-ai/glm-5-3-flash/apireference
+  ['z-ai/glm-5.3-flash', {
+    label: 'GLM',
+    fields: [
+      'model', 'messages', 'max_tokens', 'stream', 'temperature', 'top_p', 'stop',
+      'frequency_penalty', 'presence_penalty', 'seed',
+      'stream_options', 'reasoning_effort', 'tools', 'tool_choice'
+    ],
+    flattenSystemAssistant: false,
+    clamp: {
+      temperature: [0, 1],
+      top_p: [0, 1],
+      frequency_penalty: [-2, 2],
+      presence_penalty: [-2, 2]
+    }
+  }]
+]);
 
-// The API reference says system and assistant messages must have string
-// content (the content-parts list is only supported for user messages).
+function envFieldList(name) {
+  return (process.env[name] || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// System and assistant messages must have string content on the Kimi endpoint
+// (the content-parts list is only supported for user messages).
 function flattenTextContent(message) {
   if (!message || !Array.isArray(message.content)) return message;
   if (message.role !== 'system' && message.role !== 'assistant') return message;
@@ -329,25 +353,39 @@ function flattenTextContent(message) {
   return { ...message, content: text };
 }
 
-// Returns { request, dropped } where `dropped` lists removed field names.
-// Models other than the ones above are returned unchanged.
+// Returns { request, dropped, clamped }:
+//   dropped - field names removed because the endpoint doesn't document them
+//   clamped - "field old->new" notes for values moved into the allowed range
+// Models without a profile are returned unchanged.
 function shapeRequestForModel(model, request) {
-  if (!KIMI_STRICT_PARAMS || !KIMI_NATIVE_MODELS.has(model)) {
-    return { request, dropped: [] };
+  const profile = NATIVE_PROFILES.get(model);
+  if (!profile || process.env[`${profile.label}_STRICT_PARAMS`] === 'false') {
+    return { request, dropped: [], clamped: [] };
   }
 
-  const allowed = new Set([...KIMI_NATIVE_FIELDS, ...KIMI_EXTRA_FIELDS]);
+  const allowed = new Set([...profile.fields, ...envFieldList(`${profile.label}_EXTRA_FIELDS`)]);
   const shaped = {};
   const dropped = [];
+  const clamped = [];
+
   for (const [key, value] of Object.entries(request)) {
     if (value === undefined) continue;
-    if (allowed.has(key)) shaped[key] = value;
-    else dropped.push(key);
+    if (!allowed.has(key)) { dropped.push(key); continue; }
+
+    const range = profile.clamp[key];
+    if (range && typeof value === 'number' && Number.isFinite(value)) {
+      const limited = Math.min(range[1], Math.max(range[0], value));
+      if (limited !== value) clamped.push(`${key} ${value}->${limited}`);
+      shaped[key] = limited;
+    } else {
+      shaped[key] = value;
+    }
   }
-  if (Array.isArray(shaped.messages)) {
+
+  if (profile.flattenSystemAssistant && Array.isArray(shaped.messages)) {
     shaped.messages = shaped.messages.map(flattenTextContent);
   }
-  return { request: shaped, dropped };
+  return { request: shaped, dropped, clamped };
 }
 
 module.exports = {
