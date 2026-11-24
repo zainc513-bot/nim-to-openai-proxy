@@ -47,6 +47,11 @@ const HEARTBEAT_INTERVAL_MS = process.env.HEARTBEAT_INTERVAL_MS !== undefined
   ? Number(process.env.HEARTBEAT_INTERVAL_MS)
   : 10000;
 
+// For streaming requests, open the response immediately and heartbeat while
+// waiting for NIM to accept the request, so the client doesn't time out during
+// long queues or fallbacks. Set EARLY_STREAM_HEADERS=false to disable.
+const EARLY_STREAM_HEADERS = process.env.EARLY_STREAM_HEADERS !== 'false';
+
 // Optional watchdog: if the upstream sends nothing at all for this long while
 // streaming, give up with a stream error instead of hanging. 0 = off (default),
 // because a very long prompt can legitimately take a minute or more to start.
@@ -153,14 +158,17 @@ const ALIAS_FALLBACKS = {
 };
 
 // Used when an unrecognized alias is requested. Must point at a live model.
-const DEFAULT_MODEL = 'google/diffusiongemma-26b-a4b-it';
+const DEFAULT_MODEL = 'google/gemma-4-31b-it';
 
 // Ordered by observed reliability/speed — an early failing model delays every fallback behind it.
+// diffusiongemma-26b-a4b-it (HTTP 410 Gone) and nemotron-3-super-120b-a12b were
+// removed on 2026-11-24 after startup validation reported them missing from
+// NIM's catalog. Startup validation now checks this list too.
 const FALLBACK_MODELS = [
-  'google/diffusiongemma-26b-a4b-it',
   'google/gemma-4-31b-it',
-  'mistralai/mistral-nemotron',
-  'nvidia/nemotron-3-super-120b-a12b'
+  'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'meta/muse-glimmer-30b',
+  'mistralai/mistral-nemotron'
 ];
 
 // ─── Middleware ─────────────────────────────────────────────────────────
@@ -263,6 +271,15 @@ async function validateModels() {
       }
     }
 
+    for (const fb of new Set([DEFAULT_MODEL, ...FALLBACK_MODELS])) {
+      if (availableModels.has(fb)) {
+        console.log(`[VALIDATION] ✓ (fallback) ${fb}`);
+      } else {
+        console.warn(`[VALIDATION] ✗ (fallback) ${fb} (not in catalog)`);
+        invalid.push({ alias: '(fallback)', nimId: fb, error: 'Model not found in NIM catalog' });
+      }
+    }
+
     if (invalid.length > 0) {
       await sendDiscordAlert(invalid);
     } else {
@@ -312,6 +329,24 @@ function safeWrite(res, data) {
     console.warn('[STREAM] Write failed:', err.message);
   }
   return false;
+}
+
+// Opens the SSE response (headers + first bytes). Safe to call more than once.
+function openSseStream(res) {
+  if (res.headersSent) return;
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform'); // no-transform stops intermediaries from recompressing
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // tells nginx-style reverse proxies not to buffer
+
+  // Send each SSE frame as its own packet
+  if (res.socket) {
+    res.socket.setNoDelay(true);
+    res.socket.setTimeout(0);
+  }
+
+  // Send headers now so the client sees the stream open immediately
+  res.flushHeaders();
 }
 
 // ─── Helper: Completion Logging ──────────────────────────────────────────
@@ -663,13 +698,45 @@ app.post('/v1/chat/completions', async (req, res) => {
       `tools=${!!req.body.tools} chain=${modelChain.length}`
     );
 
-    const { response, model: usedModel, reasoningPayload: usedReasoningPayload } = await callWithFallback(
-      baseRequest,
-      modelChain,
-      ENABLE_THINKING_MODE,
-      reasoning_effort,
-      !!req.body.tools
-    );
+    // NIM can queue a request for minutes before it accepts it (and a failed
+    // model adds its own timeout on top). Browsers/frontends like JanitorAI
+    // give up on a response that sends no bytes, which shows up as "network
+    // error". So for streams, open the SSE response now and send heartbeat
+    // comments until the upstream accepts. Trade-off: a failure after this
+    // point reaches the client as an SSE error event rather than an HTTP error
+    // status. Set EARLY_STREAM_HEADERS=false to go back to the old behavior.
+    let waitBeat = null;
+    if (stream && EARLY_STREAM_HEADERS) {
+      openSseStream(res);
+      safeWrite(res, ': connected\n\n');
+      if (HEARTBEAT_INTERVAL_MS > 0) {
+        const waitStartedAt = Date.now();
+        waitBeat = setInterval(() => {
+          if (res.writableEnded || res.destroyed) {
+            clearInterval(waitBeat);
+            return;
+          }
+          if (safeWrite(res, ': heartbeat\n\n')) {
+            console.log(`[HEARTBEAT #${reqId}] still waiting for NIM to accept the request (${Math.round((Date.now() - waitStartedAt) / 1000)}s)`);
+          }
+        }, HEARTBEAT_INTERVAL_MS);
+        waitBeat.unref();
+      }
+    }
+
+    let callResult;
+    try {
+      callResult = await callWithFallback(
+        baseRequest,
+        modelChain,
+        ENABLE_THINKING_MODE,
+        reasoning_effort,
+        !!req.body.tools
+      );
+    } finally {
+      if (waitBeat) clearInterval(waitBeat);
+    }
+    const { response, model: usedModel, reasoningPayload: usedReasoningPayload } = callResult;
 
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
@@ -681,19 +748,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       INLINE_REASONING_MODELS.has(usedModel);
 
     if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache, no-transform'); // no-transform stops intermediaries from recompressing
-      res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no'); // tells nginx-style reverse proxies not to buffer
-
-      // Send each SSE frame as its own packet
-      if (res.socket) {
-        res.socket.setNoDelay(true);
-        res.socket.setTimeout(0);
-      }
-
-      // Send headers now so the client sees the stream open immediately
-      res.flushHeaders();
+      openSseStream(res); // already open if EARLY_STREAM_HEADERS sent it before the upstream call
 
       const decoder = new StringDecoder('utf8');
       let buffer = '';
