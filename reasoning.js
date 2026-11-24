@@ -186,6 +186,9 @@ function resolveEffectiveThinking(enableThinking, clientReasoningEffort) {
   return enableThinking;
 }
 
+// Reasoning level always sent to Kimi models (see the kimi cases below).
+const KIMI_FORCED_EFFORT = 'low';
+
 // Nemotron 3.5 Lightning has no boolean flag — only a top-level integer
 // reasoning_budget (max reasoning tokens, -1 to 32768, default 16384). This
 // tier mapping is this proxy's own approximation, not an NVIDIA-defined enum.
@@ -270,9 +273,11 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     // The server.js alias 'kimi' points at k3.1-pro, so both IDs are handled.
     case 'moonshotai/kimi-k3':
     case 'moonshotai/kimi-k3.1-pro': {
-      // No off-switch — omitting the field falls back to Kimi's own 'max'.
-      if (effort) return { reasoning_effort: effort };
-      return { reasoning_effort: enableThinking ? 'high' : 'low' };
+      // Always "low", no matter what the client sends (reasoning_effort,
+      // "on"/"off") or what ENABLE_THINKING_MODE is set to. Kimi has no
+      // off-switch, and omitting the field makes it fall back to 'max', so a
+      // value is always sent. Change KIMI_FORCED_EFFORT to use another level.
+      return { reasoning_effort: KIMI_FORCED_EFFORT };
     }
 
     // GLM 5.3 Flash: thinking can't be fully disabled, but reasoning_effort
