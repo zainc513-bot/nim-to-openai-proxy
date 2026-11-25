@@ -322,6 +322,11 @@ const NATIVE_PROFILES = new Map([
   // https://build.nvidia.com/z-ai/glm-5-3-flash/apireference
   ['z-ai/glm-5.3-flash', {
     label: 'GLM',
+    // Off unless GLM_NATIVE_PARAMS=true. It drops sampling fields such as
+    // top_k and repetition_penalty and clamps temperature/top_p to NVIDIA's
+    // documented ranges, which can make GLM repeat itself if your preset relies
+    // on them, so GLM requests are passed through unchanged by default.
+    optIn: true,
     fields: [
       'model', 'messages', 'max_tokens', 'stream', 'temperature', 'top_p', 'stop',
       'frequency_penalty', 'presence_penalty', 'seed',
@@ -359,7 +364,11 @@ function flattenTextContent(message) {
 // Models without a profile are returned unchanged.
 function shapeRequestForModel(model, request) {
   const profile = NATIVE_PROFILES.get(model);
-  if (!profile || process.env[`${profile.label}_STRICT_PARAMS`] === 'false') {
+  if (
+    !profile ||
+    process.env[`${profile.label}_STRICT_PARAMS`] === 'false' ||
+    (profile.optIn && process.env[`${profile.label}_NATIVE_PARAMS`] !== 'true')
+  ) {
     return { request, dropped: [], clamped: [] };
   }
 
